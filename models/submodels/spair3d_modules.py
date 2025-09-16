@@ -572,7 +572,7 @@ class SPAIRGlimpseVAE(torch.nn.Module):
         self.extra_predict_ratio = cfg.extra_predict_ratio
         self.no_ZPres_generator = cfg.no_ZPres_generator
 
-        self.flow_points_per_glimpse = getattr(cfg, "flow_points_per_glimpse", 256)
+        self.flow_points_per_glimpse = getattr(cfg, "flow_points_per_glimpse", 64)
 
     def forward(self, rgb, glimpse_member__local_pos, glimpse_member__glimpse_index, glimpse__center, glimpse__batch, temperature):
 
@@ -619,9 +619,30 @@ class SPAIRGlimpseVAE(torch.nn.Module):
         old_ids = glimpse_member__glimpse_index.long()
         uniq_ids, new_ids = torch.unique(old_ids, return_inverse=True, sorted=True)
 
+        if torch.all(old_ids[1:] >= old_ids[:-1]):  # already nondecreasing
+            uniq_ids, new_ids = torch.unique_consecutive(old_ids, return_inverse=True)
+        else:
+            uniq_ids, new_ids = torch.unique(old_ids, return_inverse=True, sorted=True)
+
+        K = uniq_ids.numel()                                  # number of glimpses in this batch
+        glimpse__batch_compact = glimpse__batch[uniq_ids]     # shape [K], values in [0..B-1]
+
+        # ---- Flow sampling plan (crucial) ----
+        # choose a safe, fixed number of samples per glimpse; tune if needed
+        points_per_glimpse = getattr(self, "flow_points_per_glimpse", 64)
+
+        print("FLOW POINTS PER GLIMPSE:", points_per_glimpse)
+        flow_batch = torch.arange(K, device=glimpse__z_what.device).repeat_interleave(points_per_glimpse)
+        # keep the flow small/stable; duplication will be handled by repeat_interleave above
+        extra_ratio = 0.0
+
         glimpse_predict__pos, glimpse_predict__glimpse_index = self.pos_decoder(
-            glimpse__z_what, new_ids, True, extra_predict_ratio=self.extra_predict_ratio
+            glimpse__z_what, flow_batch, True, extra_predict_ratio=extra_ratio
         )
+
+        # glimpse_predict__pos, glimpse_predict__glimpse_index = self.pos_decoder(
+        #     glimpse__z_what, new_ids, True, extra_predict_ratio=self.extra_predict_ratio
+        # )
 
         # glimpse_predict__pos = torch.tanh(glimpse_predict__pos) # generated points must live in unit ball/cube
 
