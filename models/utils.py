@@ -426,20 +426,21 @@ def linear_anneal(m, n, p, q, i):
 
         return False, m if i < p else n
 
+
 def compute_performance(path, iter_idx, max_radius,
-                Id, pos, batch,
-                glimpse__batch, 
-                glimpse__center, 
-                glimpse_member__normalized_log_alpha,
-                glimpse_member__batch, 
-                glimpse_member__glimpse_index,
-                glimpse_member__point_index,
-                glimpse_predict__glimpse_index, 
-                bg_log_alpha,
-                glimpse_chamfer_predict__local_pos,
-                bg_chamfer_predict__pos,
-                majority_vote_flag = False,
-                compute_MMD_CD = False):
+                        Id, pos, batch,
+                        glimpse__batch, 
+                        glimpse__center, 
+                        glimpse_member__normalized_log_alpha,
+                        glimpse_member__batch, 
+                        glimpse_member__glimpse_index,
+                        glimpse_member__point_index,
+                        glimpse_predict__glimpse_index, 
+                        bg_log_alpha,
+                        glimpse_chamfer_predict__local_pos,
+                        bg_chamfer_predict__pos,
+                        majority_vote_flag = False,
+                        compute_MMD_CD = False):
 
     # get all glimpse prediction from the first batch
     glimpse_predict__batch = glimpse__batch[glimpse_predict__glimpse_index]
@@ -461,55 +462,65 @@ def compute_performance(path, iter_idx, max_radius,
     glimpse_member__alpha = torch.exp(glimpse_member__normalized_log_alpha)
     glimpse_member__center = glimpse__center[glimpse_member__glimpse_index]
     glimpse_member__point_index = glimpse_member__point_index[index]
-    glimpse_chamfer_predict__global_pos = glimpse_chamfer_predict__local_pos[index] * max_radius + glimpse_member__center
+    glimpse_chamfer_predict__global_pos = (
+        glimpse_chamfer_predict__local_pos[index] * max_radius + glimpse_member__center
+    )
 
     # compute the segmentation result
-    _, segmentation = scatter_max(torch.cat((glimpse_member__alpha, alpha), dim = 0), torch.cat((glimpse_member__point_index, point_index), dim = 0), dim = 0)
-    segmentation = torch.cat((glimpse_member__glimpse_index, point_index.new_full(point_index.size(), torch.max(glimpse_member__glimpse_index) + 1)), dim = 0)[segmentation]
+    _, seg_idx = scatter_max(
+        torch.cat((glimpse_member__alpha, alpha), dim=0),
+        torch.cat((glimpse_member__point_index, point_index), dim=0),
+        dim=0
+    )
+    segmentation = torch.cat(
+        (
+            glimpse_member__glimpse_index,
+            point_index.new_full(point_index.size(), torch.max(glimpse_member__glimpse_index) + 1),
+        ),
+        dim=0
+    )[seg_idx]
 
     if majority_vote_flag:
         segmentation = majority_vote(segmentation, pos)
     else:
         segmentation, _ = consecutive_cluster(segmentation)
-    
-    # compute fg_msc and fg_sc
+
+    # fg_msc and fg_sc (leave as-is if your helper expects torch tensors)
     if Id is not None:
         sc, msc = average_segcover(Id.to(segmentation.device), segmentation)
     else:
         sc = 0
         msc = 0
 
-    # compute final reconstruction result
-    all_predict = torch.cat((glimpse_chamfer_predict__global_pos, bg_chamfer_predict__pos), dim = 0)
+    # final reconstruction
+    all_predict = torch.cat((glimpse_chamfer_predict__global_pos, bg_chamfer_predict__pos), dim=0)
     all_log_alpha = torch.cat((glimpse_member__normalized_log_alpha, bg_log_alpha))
-    all_point_index = torch.cat((glimpse_member__point_index, point_index), dim = 0)
+    all_point_index = torch.cat((glimpse_member__point_index, point_index), dim=0)
 
-    # for numerical stability, compute in log space
-    pos_reconstruct = torch.exp(scatter_logsumexp(torch.log(2 + all_predict + 1e-12) + all_log_alpha[:, None], all_point_index, dim = 0)) - 2
+    # log-space aggregation for stability
+    pos_reconstruct = torch.exp(
+        scatter_logsumexp(torch.log(2 + all_predict + 1e-12) + all_log_alpha[:, None],
+                          all_point_index, dim=0)
+    ) - 2
 
     MMD_CD_F = None
     MMD_CD_B = None
-
-    # pos_reconstruct, pos, Id, segmentation
-
     if compute_MMD_CD:
         y, x = knn(pos_reconstruct, pos, 1)
-
-        MMD_CD_F = torch.norm(pos - pos_reconstruct[x], p=None, dim = 1)
-        MMD_CD_F = torch.mean(MMD_CD_F).item()
-
+        MMD_CD_F = torch.norm(pos - pos_reconstruct[x], p=None, dim=1).mean().item()
         x, y = knn(pos, pos_reconstruct, 1)
+        MMD_CD_B = torch.norm(pos_reconstruct - pos[y], p=None, dim=1).mean().item()
 
-        MMD_CD_B = torch.norm(pos_reconstruct - pos[y], p=None, dim = 1)
-        MMD_CD_B = torch.mean(MMD_CD_B).item()
-
-    # ! only work when batch_size = 1
+    # --- ARI: move tensors to CPU/NumPy ---
     if Id is not None:
-        ARI = adjusted_rand_score(labels_true=Id, labels_pred=segmentation)
+        Id_np = Id.detach().to('cpu').view(-1).numpy()
+        seg_np = segmentation.detach().to('cpu').view(-1).numpy()
+        ARI = adjusted_rand_score(labels_true=Id_np, labels_pred=seg_np)
     else:
-        ARI = 0
+        ARI = 0.0
 
     return segmentation, ARI, sc, msc, MMD_CD_F, MMD_CD_B
+
 
 def batch_statistic(data, batch, opt = 'mean'):
 

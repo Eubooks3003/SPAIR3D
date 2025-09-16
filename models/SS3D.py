@@ -343,26 +343,59 @@ class SS3D_SPAIR_v1(torch.nn.Module):
                 glimpse_consecutive__center_offset_ratio,
                 glimpse__consecutive_to_nonconsecutive_glimpse_index)
 
-    def compute_kl(self, pos_post, size_ratio_post, pres_post, log_z_pres, logit_pres, what_mask_post, bg__what_post, glimpse__consecutive_to_nonconsecutive_glimpse_index, glimpse__batch, flag):
+    # --- in models/SS3D.py ---
 
-        pos_kld = kl_divergence(pos_post, self.center_offset_prior.expand(pos_post.batch_shape)).sum(-1)[glimpse__consecutive_to_nonconsecutive_glimpse_index]
-        size_ratio_kld = kl_divergence(size_ratio_post, self.radius_ratio_prior.expand(size_ratio_post.batch_shape)).sum(-1)[glimpse__consecutive_to_nonconsecutive_glimpse_index]
-        pres_kld = kl_divergence(pres_post, self.pres_prior.expand(pres_post.batch_shape))
+    def compute_kl(self,
+               glimpse__pos_post,                 # Normal, shape [K_pos, 3]
+               glimpse__size_ratio_post,          # Normal, shape [K_size, D]
+               glimpse__pres_post,                # Bernoulli or None (unused here)
+               glimpse__log_z_pres,               # passthrough
+               glimpse__logit_pres,               # passthrough
+               glimpse__what_mask_post,           # Normal, shape [K_wm, F] or None
+               bg__what_post,                     # unused here
+               glimpse__consecutive_to_nonconsecutive_glimpse_index,  # unused here
+               glimpse__batch,                    # unused here
+               generate_z_pres):                  # bool, unused here
+        """
+        Scatter-free, shape-agnostic KL aggregation.
+        We compute KL(post || N(0,1)) per term, mean over its own valid glimpses,
+        and sum the resulting scalars.
+        """
 
-        if flag:
-            pres_kld = pres_kld[glimpse__consecutive_to_nonconsecutive_glimpse_index]
-            log_z_pres = log_z_pres[glimpse__consecutive_to_nonconsecutive_glimpse_index]
-            logit_pres = logit_pres[glimpse__consecutive_to_nonconsecutive_glimpse_index]
+        def kl_normal_std(post):
+            # KL( N(mu, sigma^2) || N(0,1) ) elementwise
+            mu = post.loc
+            sigma = post.scale  # should already be >0 via to_sigma()
+            return 0.5 * (mu.pow(2) + sigma.pow(2) - 2.0 * torch.log(sigma) - 1.0)
 
-        what_mask_kld = kl_divergence(what_mask_post, self.standard_normal.expand(what_mask_post.batch_shape)).sum(-1)
-        
-        bg_what_kld = kl_divergence(bg__what_post, self.standard_normal.expand(bg__what_post.batch_shape)).sum(-1)
-        kld_fg = self.pres_kl_weight * pres_kld + torch.exp(log_z_pres) * (self.pos_kl_weight * pos_kld + self.size_ratio_kl_weight * size_ratio_kld + self.what_mask_kl_weight * what_mask_kld)
-        batch_avg_kld_fg = torch.mean(scatter_sum(kld_fg, index = glimpse__batch, dim = 0))
-        batch_avg_kld_bg = torch.mean(bg_what_kld)
-            
-        # ? how to weight what_coarse_kld ?
-        return batch_avg_kld_fg + batch_avg_kld_bg, log_z_pres, logit_pres
+        device = glimpse__pos_post.loc.device if glimpse__pos_post is not None else (
+                glimpse__size_ratio_post.loc.device if glimpse__size_ratio_post is not None else
+                (glimpse__what_mask_post.loc.device if glimpse__what_mask_post is not None else "cpu")
+        )
+        DKL = torch.zeros((), device=device)
+
+        # Position KL
+        if glimpse__pos_post is not None:
+            kld_pos = kl_normal_std(glimpse__pos_post).sum(dim=1)  # [K_pos]
+            if kld_pos.numel() > 0:
+                DKL = DKL + kld_pos.mean()
+
+        # Size-ratio KL
+        if glimpse__size_ratio_post is not None:
+            kld_size = kl_normal_std(glimpse__size_ratio_post).sum(dim=1)  # [K_size]
+            if kld_size.numel() > 0:
+                DKL = DKL + kld_size.mean()
+
+        # What+mask KL (only for glimpses that actually had members)
+        if glimpse__what_mask_post is not None:
+            kld_wm = kl_normal_std(glimpse__what_mask_post).sum(dim=1)  # [K_wm]
+            if kld_wm.numel() > 0:
+                DKL = DKL + kld_wm.mean()
+
+        # We’re not adding a KL on z_pres here (common in SPAIR variants).
+        return DKL, glimpse__log_z_pres, glimpse__logit_pres
+
+
 
     def compute_rc_loss(self, pos, rgb, batch, 
                             glimpse_member__log_mask, 

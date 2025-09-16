@@ -44,6 +44,8 @@ class SPAIRGridFeatureNetwork(torch.nn.Module):
         self.ar = cfg.grid_encoder_ar
         self.glimpse_type = cfg.glimpse_type
 
+        self.generate_z_pres = cfg.generate_z_pres
+
         # radius graph message passing
         if self.ar:
             self.ar1 = AutoRegistrationLayer(x_dim = 64, f_hidden = 64, f_out = 64, g_hidden = 64, g_out = 64)
@@ -556,6 +558,7 @@ class SPAIRGlimpseVAE(torch.nn.Module):
         super().__init__()
 
         self.no_ZPres_generator = False
+        self.generate_z_pres = cfg.generate_z_pres
         
         self.encoder = SPAIRGlimpseEncoder(cfg)
         if self.no_ZPres_generator:
@@ -568,6 +571,8 @@ class SPAIRGlimpseVAE(torch.nn.Module):
 
         self.extra_predict_ratio = cfg.extra_predict_ratio
         self.no_ZPres_generator = cfg.no_ZPres_generator
+
+        self.flow_points_per_glimpse = getattr(cfg, "flow_points_per_glimpse", 256)
 
     def forward(self, rgb, glimpse_member__local_pos, glimpse_member__glimpse_index, glimpse__center, glimpse__batch, temperature):
 
@@ -610,7 +615,13 @@ class SPAIRGlimpseVAE(torch.nn.Module):
         #     rgb_predict = None
 
         # glimpse_predict__pos, glimpse_predict__glimpse_index = self.pos_decoder(z_what, glimpse_index_list[-1])
-        glimpse_predict__pos, glimpse_predict__glimpse_index = self.pos_decoder(glimpse__z_what, glimpse_member__glimpse_index, True, extra_predict_ratio = self.extra_predict_ratio)
+        # old, per-point glimpse IDs
+        old_ids = glimpse_member__glimpse_index.long()
+        uniq_ids, new_ids = torch.unique(old_ids, return_inverse=True, sorted=True)
+
+        glimpse_predict__pos, glimpse_predict__glimpse_index = self.pos_decoder(
+            glimpse__z_what, new_ids, True, extra_predict_ratio=self.extra_predict_ratio
+        )
 
         # glimpse_predict__pos = torch.tanh(glimpse_predict__pos) # generated points must live in unit ball/cube
 
