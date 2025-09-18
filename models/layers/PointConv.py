@@ -38,78 +38,50 @@ class PointConv(torch.nn.Module):
 
     def forward(self, x_in, pos_in, batch_in, pos_out=None, batch_out=None,
                 in_index=None, out_index=None):
+        # Defaults
         if pos_out is None:
-            pos_out = pos_in
+            pos_out  = pos_in
             batch_out = batch_in
 
-        # Build neighbors if not provided
+        # Neighborhoods (radius() may yield zero neighbors for some out nodes!)
         if in_index is None or out_index is None:
-            # (row, col) with row indexing pos_out, col indexing pos_in
-            out_index, in_index = radius(
-                x=pos_in, y=pos_out, r=self.radius,
-                batch_x=batch_in, batch_y=batch_out,
-                max_num_neighbors=self.max_num_neighbors
-            )
+            out_index, in_index = radius(pos_in, pos_out, self.radius,
+                                        batch_in, batch_out,
+                                        max_num_neighbors=self.max_num_neighbors)
 
-        if out_index.numel() == 0:
-            # No neighbors at all: return zeros for every pos_out
-            return pos_out.new_zeros((pos_out.size(0), self.mlp3.out_features))
+        # Edge features
+        pos_local = pos_in[in_index] - pos_out[out_index]       # [E, 3]
+        M = F.celu(self.mlp1(pos_local))                        # [E, 16]
+        M = F.celu(self.mlp2(M))                                # [E, c_mid]
 
-        vals, perm = torch.sort(out_index)         # works on old PyTorch too
-        out_index = vals
-        in_index  = in_index[perm]
-
-        # Now compact the group ids so to_dense_batch is tight
-        uniq, out_compact = torch.unique_consecutive(out_index, return_inverse=True)
-        num_groups = int(uniq.numel())
-        # Safe per-group degree (>=1)
-        deg = scatter_sum(
-            torch.ones_like(out_compact, dtype=torch.float32),
-            out_compact, dim=0, dim_size=uniq.numel()
-        ).clamp_min(1.0)
-
-        # Local coordinates
-        pos_i = pos_out[out_index]  # still index with original out_index
-        pos_j = pos_in[in_index]
-        pos_local = pos_j - pos_i
-        pos_local = torch.nan_to_num(pos_local)
-
-        # Dense grouping by compact ids
-        pos_local_dense, mask = to_dense_batch(pos_local, out_compact, fill_value=0.0)
-
+        # Node/edge signal
         if x_in is None:
-            x_dense = mask.float().unsqueeze(-1)  # [B,K,1]
+            x_edge = torch.ones((in_index.numel(), self.c_in), device=pos_in.device, dtype=pos_in.dtype)
         else:
-            x_neighbors = x_in[in_index]
-            # normalize by neighbor count (per-edge weight = 1/deg[group])
-            w = (1.0 / deg[out_compact]).unsqueeze(-1)
-            x_neighbors = x_neighbors * w
-            x_dense, _ = to_dense_batch(x_neighbors, out_compact, fill_value=0.0)
+            x_edge = x_in[in_index]                              # [E, c_in]
 
-        # MLPs on geometry; zero-out padded slots explicitly
-        M = self.mlp1(pos_local_dense)
-        M = F.celu(M)
-        M = self.mlp2(M)
-        M = F.celu(M)
-        M = M * mask.unsqueeze(-1)  # padded rows contribute nothing
+        # Degree per out node (size N_out), clamped to avoid 0/0
+        N_out = pos_out.size(0)
+        deg = scatter_sum(
+            torch.ones_like(out_index, dtype=pos_in.dtype),
+            out_index, dim=0, dim_size=N_out
+        ).clamp_min(1.0)                                        # [N_out]
 
-        # Aggregate: [B,Cin,K] @ [B,K,Cmid] -> [B,Cin,Cmid]
-        product = torch.bmm(x_dense.permute(0, 2, 1), M)
-        product = product.reshape(product.size(0), -1)  # [B, Cin*Cmid]
+        # Normalize messages by degree of their destination
+        x_edge = x_edge / deg[out_index].unsqueeze(1)
 
-        out = self.mlp3(product)  # [B, Cout]
-        out = torch.nan_to_num(out, nan=0.0, posinf=1e4, neginf=-1e4)
+        # Outer product per edge: (c_in x c_mid), then sum over neighbors
+        #   E, c_in, c_mid  -> flatten to E, (c_in*c_mid), then scatter-sum to N_out
+        outer = torch.einsum('ei,ej->eij', x_edge, M)           # [E, c_in, c_mid]
+        agg   = scatter_sum(outer.reshape(-1, self.c_in*self.c_mid),
+                            out_index, dim=0, dim_size=N_out)   # [N_out, c_in*c_mid]
 
-        # We built B = num_groups rows, one per unique out point encountered.
-        # If you need exactly pos_out.size(0) rows, scatter back (optional).
-        if num_groups != pos_out.size(0):
-            # Map compact groups back to original out ids we actually touched:
-            uniq_out, _ = torch.unique_consecutive(out_index, return_inverse=False)
-            full = pos_out.new_zeros((pos_out.size(0), out.size(1)))
-            full[uniq_out] = out
-            out = full
+        out = self.mlp3(agg)                                    # [N_out, c_out]
 
+        # Final safety belt (shouldn’t trigger after the fixes above)
+        out = torch.nan_to_num(out, nan=0.0, posinf=1e6, neginf=-1e6)
         return out
+
 
 
 class PointDeconv(torch.nn.Module):

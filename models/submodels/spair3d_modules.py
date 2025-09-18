@@ -5,7 +5,7 @@ from torch.distributions.normal import Normal
 from torch.distributions.relaxed_bernoulli import LogitRelaxedBernoulli
 from torch.distributions.bernoulli import Bernoulli
 
-from torch_geometric.nn import radius_graph, LayerNorm
+from torch_geometric.nn import radius_graph, LayerNorm, GraphNorm
 from torch_scatter import scatter_mean, scatter_sum, scatter_log_softmax
 
 from models.layers.AutoRegistration import AutoRegistrationLayer
@@ -137,9 +137,9 @@ class SPAIRGridFeatureNetwork(torch.nn.Module):
         if self.ar:
             self.ar1 = AutoRegistrationLayer(x_dim = 64,  f_hidden = 64,  f_out = 64,  g_hidden = 64,  g_out = 64)
             self.ar2 = AutoRegistrationLayer(x_dim = 128, f_hidden = 128, f_out = 128, g_hidden = 128, g_out = 128)
-            self.ar3 = AutoRegistrationLayer(x_dim = 256, f_hidden = 256, f_out = 256, g_hidden = 256, g_out = 256)
-            self.ar4 = AutoRegistrationLayer(x_dim = 256, f_hidden = 256, f_out = 256, g_hidden = 256, g_out = 256)
-            self.ar5 = AutoRegistrationLayer(x_dim = 256, f_hidden = 256, f_out = 256, g_hidden = 256, g_out = 256)
+            self.ar3 = AutoRegistrationLayer(x_dim = 256, f_hidden = 256, f_out = 256, g_hidden = 256, g_out = 256, end_relu=False)
+            self.ar4 = AutoRegistrationLayer(x_dim = 256, f_hidden = 256, f_out = 256, g_hidden = 256, g_out = 256, end_relu=False)
+            self.ar5 = AutoRegistrationLayer(x_dim = 256, f_hidden = 256, f_out = 256, g_hidden = 256, g_out = 256, end_relu=False)
 
         self.conv1 = PointConv(16/1, max_num_neighbors = 128, c_in = 32,  c_mid = 32,  c_out = 64)
         self.conv2 = PointConv(2/16, max_num_neighbors = 128, c_in = 64,  c_mid = 64,  c_out = 128)
@@ -147,9 +147,10 @@ class SPAIRGridFeatureNetwork(torch.nn.Module):
         self.conv4 = CenterShift(c_in = 256, c_mid = 256, c_out = 256)
 
         if self.layer_norm:
-            self.norm1 = LayerNorm(64)
-            self.norm2 = LayerNorm(128)
-            self.norm3 = LayerNorm(256)
+            self.norm1 = GraphNorm(64,  eps=1e-5)
+            self.norm2 = GraphNorm(128, eps=1e-5)
+            self.norm3 = GraphNorm(256, eps=1e-5)
+
 
         if self.glimpse_type == "ball":
             self.linear = torch.nn.Linear(in_features = 256, out_features = 9)
@@ -251,6 +252,9 @@ class SPAIRGridFeatureNetwork(torch.nn.Module):
         self._assert_finite("GridFeat.after conv3", feature)
         with _nvtx("GridFeat.radius_graph_2"):
             edge_index = radius_graph(pos, 4 / 16, batch, loop=True)
+
+            deg = torch.bincount(edge_index[1], minlength=pos.size(0))
+            if (deg == 0).any(): print("WARN: zero-degree nodes in AR graph")
         if self.ar:
             with _nvtx("GridFeat.ar3-5"):
                 feature, _, _ = self.ar3(feature, pos, edge_index)
@@ -260,8 +264,11 @@ class SPAIRGridFeatureNetwork(torch.nn.Module):
                 feature, _, _ = self.ar5(feature, pos, edge_index)
                 self._assert_finite("GridFeat.after ar5", feature)
 
+        self._assert_finite("GridFeat. before norm3", feature)
         if self.layer_norm:
-            feature = self.norm3(feature, batch)
+            feature = torch.nan_to_num(feature, nan=0.0, posinf=1e6, neginf=-1e6)
+            feature = feature.clamp_(-1e4, 1e4)  # tame outliers
+            feature = self.norm3(feature, batch)  
             self._assert_finite("GridFeat.after norm3", feature)
 
         voxel_center = find_voxel_center(pos, start=min_pos, size=2 / 16)

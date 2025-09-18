@@ -127,6 +127,20 @@ def _canonicalize_pos_batch(pos, bidx, device, log_prefix=""):
 
     return pos, bidx
 
+def param_groups_no_decay(model, weight_decay=1e-4):
+    decay, no_decay = [], []
+    for n, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        if p.ndim == 1 or any(k in n.lower() for k in ['bias','norm','layernorm','bn','graphnorm']):
+            no_decay.append(p)
+        else:
+            decay.append(p)
+    return [
+        {'params': decay,    'weight_decay': weight_decay},
+        {'params': no_decay, 'weight_decay': 0.0},
+    ]
+
 # ---- Batch extractor (dict, tuple/list, or PyG Batch-like) ----
 def extract_batch(batch_data):
     """Return (pos, rgb, batch_idx, Id, layer). May create batch_idx if missing."""
@@ -225,7 +239,10 @@ def main():
     model = fet.load(config.model_config, config).to(device)
 
     lr = getattr(config, 'lr', 1e-4)  # from train.lr if provided
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr, amsgrad=True)
+
+
+    optimizer = torch.optim.Adam(param_groups_no_decay(model), lr=lr, amsgrad=True)
+    # optimizer = torch.optim.Adam(model.parameters(), lr=lr, amsgrad=True)
 
     iter_idx = 0
     writer = SummaryWriter(logdir) if is_master else None
