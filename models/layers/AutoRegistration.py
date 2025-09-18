@@ -45,7 +45,7 @@ class AutoRegistration(MessagePassing):
     """
     
     def __init__(self, g, f, h, end_relu):
-        super().__init__(aggr='max')
+        super().__init__(aggr='mean')
 
         self.g = g
         self.f = f
@@ -69,21 +69,20 @@ class AutoRegistration(MessagePassing):
         return out
 
     def message(self, x_i, x_j, pos_i, pos_j):
-
-        delta_pos_i = F.relu(self.h(x_i))
-        delta_pos = pos_j - pos_i + delta_pos_i
-
-        delta_pos = pos_j - pos_i
-
-        return F.relu(self.f(torch.cat([x_j, delta_pos], dim = 1)))
-    
+        # restore the learned shift & keep it bounded
+        delta_pos = (pos_j - pos_i + F.relu(self.h(x_i))).clamp_(-1.0, 1.0)
+        m = self.f(torch.cat([x_j, delta_pos], dim=1))
+        m = F.relu(m)
+        return torch.nan_to_num(m, nan=0.0, posinf=1e6, neginf=-1e6)
 
     def update(self, aggr_out, x, pos):
-
+        out = aggr_out
         if self.g is not None:
-            aggr_out = self.g(torch.cat([aggr_out, x], dim = -1))
+            out = self.g(torch.cat([aggr_out, x], dim=-1))
+        if self.end_relu:
+            out = F.celu(out)
+        return torch.nan_to_num(out, nan=0.0, posinf=1e6, neginf=-1e6)
 
-        return aggr_out
 
     def __repr__(self):
         return '{}(g={}, f={}, h={})'.format(self.__class__.__name__, self.g, self.f, self.h)
