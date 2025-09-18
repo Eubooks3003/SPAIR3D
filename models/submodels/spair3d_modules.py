@@ -1,3 +1,4 @@
+import os
 import torch
 import torch.nn.functional as F
 from torch.distributions.normal import Normal
@@ -5,214 +6,256 @@ from torch.distributions.relaxed_bernoulli import LogitRelaxedBernoulli
 from torch.distributions.bernoulli import Bernoulli
 
 from torch_geometric.nn import radius_graph, LayerNorm
-
 from torch_scatter import scatter_mean, scatter_sum, scatter_log_softmax
 
 from models.layers.AutoRegistration import AutoRegistrationLayer
 from models.layers.PointConv import PointConv, CenterShift
 from models.utils import to_sigma, find_voxel_center, voxel_mean_pool
 
-class SPAIRPointFeatureNetwork(torch.nn.Module):
+# -------------------- Lightweight profiling helpers --------------------
+from contextlib import contextmanager
 
+_ENABLE_MEM    = os.getenv("SPAIR_MEM", "0") == "1"
+_ENABLE_SHAPES = os.getenv("SPAIR_SHAPES", "0") == "1"
+_ENABLE_NVTX   = os.getenv("SPAIR_NVTX", "0") == "1"
+
+def _mb(x): return x / (1024.0 ** 2)
+
+def _mem(tag: str):
+    if _ENABLE_MEM and torch.cuda.is_available():
+        torch.cuda.synchronize()
+        a = _mb(torch.cuda.memory_allocated())
+        r = _mb(torch.cuda.memory_reserved())
+        p = _mb(torch.cuda.max_memory_allocated())
+        print(f"[MEM] {tag}: alloc={a:.1f}MB reserved={r:.1f}MB peak={p:.1f}MB")
+
+def _reset_peak():
+    if _ENABLE_MEM and torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+
+def _shape_str(t):
+    try:
+        return tuple(t.shape)
+    except Exception:
+        return "?"
+
+def _shapes(tag: str, **tensors):
+    if _ENABLE_SHAPES:
+        parts = []
+        for k, v in tensors.items():
+            if isinstance(v, torch.Tensor):
+                parts.append(f"{k}={tuple(v.shape)} {str(v.dtype).replace('torch.', '')}")
+            elif isinstance(v, (list, tuple)) and len(v) and isinstance(v[0], torch.Tensor):
+                parts.append(f"{k}[0]={tuple(v[0].shape)} ... (len={len(v)})")
+            else:
+                parts.append(f"{k}={type(v).__name__}")
+        print(f"[SHAPE] {tag}: " + ", ".join(parts))
+
+@contextmanager
+def _nvtx(name: str):
+    if _ENABLE_NVTX and torch.cuda.is_available():
+        torch.cuda.nvtx.range_push(name)
+        try:
+            yield
+        finally:
+            torch.cuda.nvtx.range_pop()
+    else:
+        yield
+# ----------------------------------------------------------------------
+
+
+class SPAIRPointFeatureNetwork(torch.nn.Module):
     def __init__(self):
         super().__init__()
-
-        self.radius = 1/16          
+        self.radius = 1/16
         self.max_num_neighbors = 128
-
-        self.conv1 = PointConv(c_in = 3, c_mid = 8, c_out = 8)
-        self.conv2 = PointConv(c_in = 8, c_mid = 16, c_out = 16)
+        self.conv1 = PointConv(c_in = 3,  c_mid = 8,  c_out = 8)
+        self.conv2 = PointConv(c_in = 8,  c_mid = 16, c_out = 16)
         self.conv3 = PointConv(c_in = 16, c_mid = 32, c_out = 32)
 
     def forward(self, pos, rgb, batch):
+        _shapes("PointFeat.in", pos=pos, batch=batch)
+        _mem("PointFeat:start")
+        with _nvtx("PointFeat.radius_graph"):
+            out_index, in_index = radius_graph(pos, self.radius, batch, loop=True,
+                                               max_num_neighbors=64, flow='target_to_source')
+        _mem("PointFeat:after radius_graph")
 
-        out_index, in_index = radius_graph(pos, self.radius, batch, loop=True, max_num_neighbors=64, flow='target_to_source')
+        with _nvtx("PointFeat.conv1"):
+            out = F.celu(self.conv1(pos, pos, batch, in_index=in_index, out_index=out_index))
+        _mem("PointFeat:after conv1")
 
-        out = F.celu(self.conv1(pos, pos, batch, in_index = in_index, out_index = out_index))
-        out = F.celu(self.conv2(out, pos, batch, in_index = in_index, out_index = out_index))
-        out = F.celu(self.conv3(out, pos, batch, in_index = in_index, out_index = out_index))
+        with _nvtx("PointFeat.conv2"):
+            out = F.celu(self.conv2(out, pos, batch, in_index=in_index, out_index=out_index))
+        _mem("PointFeat:after conv2")
+
+        with _nvtx("PointFeat.conv3"):
+            out = F.celu(self.conv3(out, pos, batch, in_index=in_index, out_index=out_index))
+        _mem("PointFeat:end")
 
         return pos, out, batch
 
+
 class SPAIRGridFeatureNetwork(torch.nn.Module):
-
     def __init__(self, cfg):
-
         super().__init__()
-
         self.layer_norm = cfg.grid_encoder_ln
         self.ar = cfg.grid_encoder_ar
         self.glimpse_type = cfg.glimpse_type
-
         self.generate_z_pres = cfg.generate_z_pres
 
-        # radius graph message passing
         if self.ar:
-            self.ar1 = AutoRegistrationLayer(x_dim = 64, f_hidden = 64, f_out = 64, g_hidden = 64, g_out = 64)
+            self.ar1 = AutoRegistrationLayer(x_dim = 64,  f_hidden = 64,  f_out = 64,  g_hidden = 64,  g_out = 64)
             self.ar2 = AutoRegistrationLayer(x_dim = 128, f_hidden = 128, f_out = 128, g_hidden = 128, g_out = 128)
             self.ar3 = AutoRegistrationLayer(x_dim = 256, f_hidden = 256, f_out = 256, g_hidden = 256, g_out = 256)
             self.ar4 = AutoRegistrationLayer(x_dim = 256, f_hidden = 256, f_out = 256, g_hidden = 256, g_out = 256)
             self.ar5 = AutoRegistrationLayer(x_dim = 256, f_hidden = 256, f_out = 256, g_hidden = 256, g_out = 256)
 
-        # grid information aggregation
-        self.conv1 = PointConv(16, max_num_neighbors = 128, c_in = 32, c_mid = 32, c_out = 64)
-        self.conv2 = PointConv(2/16, max_num_neighbors = 128, c_in = 64, c_mid = 64, c_out = 128)
+        self.conv1 = PointConv(16/1, max_num_neighbors = 128, c_in = 32,  c_mid = 32,  c_out = 64)
+        self.conv2 = PointConv(2/16, max_num_neighbors = 128, c_in = 64,  c_mid = 64,  c_out = 128)
         self.conv3 = PointConv(2/16, max_num_neighbors = 128, c_in = 128, c_mid = 128, c_out = 256)
         self.conv4 = CenterShift(c_in = 256, c_mid = 256, c_out = 256)
 
-        # normalization
         if self.layer_norm:
             self.norm1 = LayerNorm(64)
             self.norm2 = LayerNorm(128)
             self.norm3 = LayerNorm(256)
 
-        # TODO: wasting one digit for now if self.generate_z_pres is False
         if self.glimpse_type == "ball":
             self.linear = torch.nn.Linear(in_features = 256, out_features = 9)
         elif self.glimpse_type == "box":
             self.linear = torch.nn.Linear(in_features = 256, out_features = 13)
 
     def forward(self, pos, feature, batch, temperature):
-        """
-        clustering is done in entire point clouds, thus use batch as index.
-        """
+        _reset_peak()
+        _shapes("GridFeat.in", pos=pos, feature=feature, batch=batch)
+        _mem("GridFeat:start")
 
-        max_pos, _ = torch.max(pos, dim = 0) 
-        min_pos, _ = torch.min(pos, dim = 0)
-        # add noise that ranges from 0 to voxel_gird_size
+        max_pos, _ = torch.max(pos, dim=0)
+        min_pos, _ = torch.min(pos, dim=0)
         noise = torch.rand_like(min_pos) * (1/8)
         min_pos -= noise
 
-        (out_index, in_index), pos, batch, pos_sample, batch_sample, voxel_cluster, voxel_cluster_sample, inv = voxel_mean_pool(pos = pos, batch = batch, start = min_pos, end = max_pos, size = 0.5 / 16)
-        feature = feature[inv]
-        
-        # # ! Debug: with voxel grid clustering, every point is assigned to one and only one cluster, torch.min(num_points) == 0 means that
-        # num_points = scatter_sum(torch.ones(out_index.shape, device=in_index.device), out_index, dim = 0)
-        # assert torch.min(num_points) > 0
-        # # ! Debug:
+        with _nvtx("GridFeat.voxel_pool_0"):
+            (out_index, in_index), pos, batch, pos_sample, batch_sample, voxel_cluster, voxel_cluster_sample, inv = \
+                voxel_mean_pool(pos=pos, batch=batch, start=min_pos, end=max_pos, size=0.5 / 16)
+            feature = feature[inv]
+        _shapes("GridFeat.pool0", pos=pos, pos_sample=pos_sample, feature=feature)
+        _mem("GridFeat:after pool0")
 
-        # voxel_cluster << batch
-        
-        feature = F.celu(self.conv1(x_in = feature, pos_in = pos, batch_in = voxel_cluster, pos_out = pos_sample, batch_out = voxel_cluster_sample, in_index = in_index, out_index = out_index))
-
-        ################################################################################################
+        with _nvtx("GridFeat.conv1"):
+            feature = F.celu(self.conv1(x_in=feature, pos_in=pos, batch_in=voxel_cluster,
+                                        pos_out=pos_sample, batch_out=voxel_cluster_sample,
+                                        in_index=in_index, out_index=out_index))
+        _mem("GridFeat:after conv1")
 
         pos = pos_sample
         batch = batch_sample
 
-        edge_index = radius_graph(pos, 0.5 / 16, batch, loop=True)
-
+        with _nvtx("GridFeat.radius_graph_0"):
+            edge_index = radius_graph(pos, 0.5 / 16, batch, loop=True)
         if self.ar:
-            feature, _, _ = self.ar1(feature, pos, edge_index)
-
+            with _nvtx("GridFeat.ar1"):
+                feature, _, _ = self.ar1(feature, pos, edge_index)
         if self.layer_norm:
             feature = self.norm1(feature, batch)
 
-        (out_index, in_index), pos, batch, pos_sample, batch_sample, voxel_cluster, voxel_cluster_sample, inv = voxel_mean_pool(pos = pos, batch = batch, start = min_pos, end = max_pos, size = 1 / 16)
-        feature = feature[inv]
+        with _nvtx("GridFeat.voxel_pool_1"):
+            (out_index, in_index), pos, batch, pos_sample, batch_sample, voxel_cluster, voxel_cluster_sample, inv = \
+                voxel_mean_pool(pos=pos, batch=batch, start=min_pos, end=max_pos, size=1 / 16)
+            feature = feature[inv]
+        _mem("GridFeat:after pool1")
 
-        # # ! Debug:
-        # num_points = scatter_sum(torch.ones(out_index.shape, device=in_index.device), out_index, dim = 0)
-        # assert torch.min(num_points) > 0
-        # # ! Debug:
-
-        feature = F.celu(self.conv2(x_in = feature, pos_in = pos, batch_in = voxel_cluster, pos_out = pos_sample, batch_out = voxel_cluster_sample, in_index = in_index, out_index = out_index))
-
-        ################################################################################################
+        with _nvtx("GridFeat.conv2"):
+            feature = F.celu(self.conv2(x_in=feature, pos_in=pos, batch_in=voxel_cluster,
+                                        pos_out=pos_sample, batch_out=voxel_cluster_sample,
+                                        in_index=in_index, out_index=out_index))
+        _mem("GridFeat:after conv2")
 
         pos = pos_sample
         batch = batch_sample
 
-        edge_index = radius_graph(pos, 2 / 16, batch, loop=True)
-
+        with _nvtx("GridFeat.radius_graph_1"):
+            edge_index = radius_graph(pos, 2 / 16, batch, loop=True)
         if self.ar:
-            feature, _, _ = self.ar2(feature, pos, edge_index)
-
+            with _nvtx("GridFeat.ar2"):
+                feature, _, _ = self.ar2(feature, pos, edge_index)
         if self.layer_norm:
             feature = self.norm2(feature, batch)
 
+        with _nvtx("GridFeat.voxel_pool_2"):
+            (out_index, in_index), pos, batch, pos_sample, batch_sample, voxel_cluster, voxel_cluster_sample, inv = \
+                voxel_mean_pool(pos=pos, batch=batch, start=min_pos, end=max_pos, size=2 / 16)
+            feature = feature[inv]
+        _mem("GridFeat:after pool2")
 
-        (out_index, in_index), pos, batch, pos_sample, batch_sample, voxel_cluster, voxel_cluster_sample, inv = voxel_mean_pool(pos = pos, batch = batch, start = min_pos, end = max_pos, size = 2 / 16)
-        feature = feature[inv]
-
-        # # ! Debug:
-        # num_points = scatter_sum(torch.ones(out_index.shape, device=in_index.device), out_index, dim = 0)
-        # assert torch.min(num_points) > 0
-        # # ! Debug:
-
-        feature = F.celu(self.conv3(x_in = feature, pos_in = pos, batch_in = voxel_cluster, pos_out = pos_sample, batch_out = voxel_cluster_sample, in_index = in_index, out_index = out_index))
-
-        ################################################################################################
+        with _nvtx("GridFeat.conv3"):
+            feature = F.celu(self.conv3(x_in=feature, pos_in=pos, batch_in=voxel_cluster,
+                                        pos_out=pos_sample, batch_out=voxel_cluster_sample,
+                                        in_index=in_index, out_index=out_index))
+        _mem("GridFeat:after conv3")
 
         pos = pos_sample
         batch = batch_sample
 
-        edge_index = radius_graph(pos, 4 / 16, batch, loop=True)
-
+        with _nvtx("GridFeat.radius_graph_2"):
+            edge_index = radius_graph(pos, 4 / 16, batch, loop=True)
         if self.ar:
-            feature, _, _ = self.ar3(feature, pos, edge_index)
-            feature, _, _ = self.ar4(feature, pos, edge_index)
-            feature, _, _ = self.ar5(feature, pos, edge_index)
-
+            with _nvtx("GridFeat.ar3-5"):
+                feature, _, _ = self.ar3(feature, pos, edge_index)
+                feature, _, _ = self.ar4(feature, pos, edge_index)
+                feature, _, _ = self.ar5(feature, pos, edge_index)
         if self.layer_norm:
             feature = self.norm3(feature, batch)
 
-        # find voxel center of the corresponding pos
-        voxel_center = find_voxel_center(pos, start = min_pos, size = 2 / 16)
+        voxel_center = find_voxel_center(pos, start=min_pos, size=2 / 16)
 
-        # move the glimpse center offset origin to voxel center
-        center_feature = self.conv4(feature, pos, voxel_center)
+        with _nvtx("GridFeat.center_shift"):
+            center_feature = self.conv4(feature, pos, voxel_center)
 
-        out = self.linear(center_feature) # B * N, 9
+        with _nvtx("GridFeat.linear"):
+            out = self.linear(center_feature)
 
         if self.glimpse_type == "ball":
-            mu_pos, sigma_pos, mu_size_ratio, sigma_size_ratio, glimpse__logit_pres = torch.split(out, [3, 3, 1, 1, 1], dim = 1)
-        else: # self.glimpse_type == "box":
-            mu_pos, sigma_pos, mu_size_ratio, sigma_size_ratio, glimpse__logit_pres = torch.split(out, [3, 3, 3, 3, 1], dim = 1) #
+            mu_pos, sigma_pos, mu_size_ratio, sigma_size_ratio, glimpse__logit_pres = \
+                torch.split(out, [3, 3, 1, 1, 1], dim=1)
+        else:
+            mu_pos, sigma_pos, mu_size_ratio, sigma_size_ratio, glimpse__logit_pres = \
+                torch.split(out, [3, 3, 3, 3, 1], dim=1)
 
         pos_post = Normal(mu_pos, to_sigma(sigma_pos))
-        # print(to_sigma(sigma_pos))
         size_ratio_post = Normal(mu_size_ratio, to_sigma(sigma_size_ratio))
 
         z_pos = pos_post.rsample()
-        # z_pos = mu_pos
-
-        z_r = size_ratio_post.rsample()
-        # z_r = mu_size_ratio
+        z_r   = size_ratio_post.rsample()
 
         pres_post = None
         log_z_pres = None
         glimpse__logit_pres = None
 
         glimpse__center_offset_ratio = torch.tanh(z_pos)
-        glimpse__ball_radius_ratio = torch.sigmoid(z_r)
+        glimpse__ball_radius_ratio   = torch.sigmoid(z_r)
 
-        return (glimpse__center_offset_ratio, glimpse__ball_radius_ratio, log_z_pres, glimpse__logit_pres), (pos_post, size_ratio_post, pres_post), voxel_center, feature, pos, batch_sample
+        _mem("GridFeat:end")
+        return (glimpse__center_offset_ratio, glimpse__ball_radius_ratio, log_z_pres, glimpse__logit_pres), \
+               (pos_post, size_ratio_post, pres_post), voxel_center, feature, pos, batch_sample
+
 
 class SPAIRGlimpseEncoder(torch.nn.Module):
-
     def __init__(self, cfg):
         super().__init__()
-        """
-        takes in glimpse and generate masks and predicted point coordinates
-        current structure: one encoder and two decoders, one MLP decoder for point prediction and one point conv decoder for mask prediction
-        """
-
         self.layer_norm = cfg.glimpse_encoder_ln
         self.ar = cfg.glimpse_encoder_ar
 
-        # radius graph message passing
         if self.ar:
-            self.ar1 = AutoRegistrationLayer(x_dim = 3, f_hidden = 8, f_out = 8, g_hidden = 8, g_out = 8)
-            self.ar2 = AutoRegistrationLayer(x_dim = 32, f_hidden = 32, f_out = 32, g_hidden = 32, g_out = 32)
-            self.ar3 = AutoRegistrationLayer(x_dim = 128, f_hidden = 128, f_out = 128, g_hidden = 128, g_out = 128)
+            self.ar1 = AutoRegistrationLayer(x_dim = 3,   f_hidden = 8,  f_out = 8,  g_hidden = 8,  g_out = 8)
+            self.ar2 = AutoRegistrationLayer(x_dim = 32,  f_hidden = 32, f_out = 32, g_hidden = 32, g_out = 32)
+            self.ar3 = AutoRegistrationLayer(x_dim = 128, f_hidden = 128,f_out = 128,g_hidden = 128,g_out = 128)
 
-        # grid information aggregation
         self.conv1 = PointConv(0.25, max_num_neighbors = 64, c_in = 8 if self.ar else 1, c_mid = 16, c_out = 32)
-        self.conv2 = PointConv(0.5, max_num_neighbors = 64, c_in = 32, c_mid = 64, c_out = 128)
-        self.conv3 = PointConv(1, max_num_neighbors = 64, c_in = 128, c_mid = 128, c_out = 256)
+        self.conv2 = PointConv(0.5,  max_num_neighbors = 64, c_in = 32, c_mid = 64, c_out = 128)
+        self.conv3 = PointConv(1,    max_num_neighbors = 64, c_in = 128,c_mid = 128,c_out = 256)
 
-        # normalization
         if self.layer_norm:
             self.norm1 = LayerNorm(16)
             self.norm2 = LayerNorm(64)
@@ -221,345 +264,320 @@ class SPAIRGlimpseEncoder(torch.nn.Module):
 
         self.linear = torch.nn.Linear(in_features = 256, out_features = 256)
 
-        # MLP decoder
+    def forward(self, rgb, pos, glimpse_member__glimpse_index, glimpse__center, glimpse__batch):
+        _reset_peak()
+        _shapes("Enc.in", pos=pos, idx=glimpse_member__glimpse_index)
+        _mem("Enc:start")
 
-    def forward(self, rgb, pos, glimpse_member__glimpse_index, glimpse__center, glimpse__batch): # pos == glimpse_member__local_pos, batch == glimpse_member__glimpse_index
-
-        min_pos, _ = torch.min(pos, dim = 0)
-        max_pos, _ = torch.max(pos, dim = 0)
-        # add noise that ranges from 0 to voxel_gird_size
+        min_pos, _ = torch.min(pos, dim=0)
+        max_pos, _ = torch.max(pos, dim=0)
         noise = torch.rand_like(min_pos)
         min_pos -= noise
-
 
         pos_list = [pos]
         glimpse_index_list = [glimpse_member__glimpse_index]
         in_out_index_list = []
 
-        edge_index = radius_graph(pos, 0.25, glimpse_member__glimpse_index, loop=True)
+        with _nvtx("Enc.rg_0"):
+            edge_index = radius_graph(pos, 0.25, glimpse_member__glimpse_index, loop=True)
 
         if self.ar:
-            feature, _, _ = self.ar1(pos, pos, edge_index)
+            with _nvtx("Enc.ar1"):
+                feature, _, _ = self.ar1(pos, pos, edge_index)
             if self.layer_norm:
                 feature = self.norm1(feature, glimpse_member__glimpse_index)
         else:
             feature = rgb
-        # use voxel pooling to make sure that all points in one voxel are covered.
-        (out_index, in_index), pos, glimpse_member__glimpse_index, pos_sample, glimpse_member_sample__glimpse_index, voxel_cluster, voxel_cluster_sample, inv = voxel_mean_pool(pos = pos, batch = glimpse_member__glimpse_index, start = min_pos, end = max_pos, size = 0.25)
-        
-        # # ! Debug: with voxel grid clustering, every point is assigned to one and only one cluster, torch.min(num_points) == 0 means that
-        # num_points = scatter_sum(torch.ones(out_index.shape, device=in_index.device), out_index, dim = 0)
-        # assert torch.min(num_points) > 0
-        # # ! Debug:
 
-        # voxel_cluster << batch
-        
-        feature = F.celu(self.conv1(x_in = feature, pos_in = pos, batch_in = voxel_cluster, pos_out = pos_sample, batch_out = voxel_cluster_sample, in_index = in_index, out_index = out_index))
-
-        ################################################################################################
+        with _nvtx("Enc.pool0"):
+            (out_index, in_index), pos, glimpse_member__glimpse_index, pos_sample, glimpse_member_sample__glimpse_index, \
+            voxel_cluster, voxel_cluster_sample, inv = voxel_mean_pool(
+                pos=pos, batch=glimpse_member__glimpse_index, start=min_pos, end=max_pos, size=0.25)
+        with _nvtx("Enc.conv1"):
+            feature = F.celu(self.conv1(x_in=feature, pos_in=pos, batch_in=voxel_cluster,
+                                        pos_out=pos_sample, batch_out=voxel_cluster_sample,
+                                        in_index=in_index, out_index=out_index))
+        _mem("Enc:after conv1")
 
         pos = pos_sample
         glimpse_member__glimpse_index = glimpse_member_sample__glimpse_index
-
         pos_list.append(pos)
         glimpse_index_list.append(glimpse_member__glimpse_index)
         in_out_index_list.append((in_index, out_index))
 
-        edge_index = radius_graph(pos, 0.5, glimpse_member__glimpse_index, loop=True)
-
+        with _nvtx("Enc.rg_1"):
+            edge_index = radius_graph(pos, 0.5, glimpse_member__glimpse_index, loop=True)
         if self.ar:
-            feature, _, _ = self.ar2(feature, pos, edge_index)
-
+            with _nvtx("Enc.ar2"):
+                feature, _, _ = self.ar2(feature, pos, edge_index)
         if self.layer_norm:
             feature = self.norm2(feature, glimpse_member__glimpse_index)
 
-        (out_index, in_index), pos, glimpse_member__glimpse_index, pos_sample, glimpse_member_sample__glimpse_index, voxel_cluster, voxel_cluster_sample, inv = voxel_mean_pool(pos = pos, batch = glimpse_member__glimpse_index, start = min_pos, end = max_pos, size = 0.5)
-        feature = feature[inv]
-
-        # # ! Debug:
-        # num_points = scatter_sum(torch.ones(out_index.shape, device=in_index.device), out_index, dim = 0)
-        # assert torch.min(num_points) > 0
-        # # ! Debug:
-
-        feature = F.celu(self.conv2(x_in = feature, pos_in = pos, batch_in = voxel_cluster, pos_out = pos_sample, batch_out = voxel_cluster_sample, in_index = in_index, out_index = out_index))
-
-        ################################################################################################
+        with _nvtx("Enc.pool1"):
+            (out_index, in_index), pos, glimpse_member__glimpse_index, pos_sample, glimpse_member_sample__glimpse_index, \
+            voxel_cluster, voxel_cluster_sample, inv = voxel_mean_pool(
+                pos=pos, batch=glimpse_member__glimpse_index, start=min_pos, end=max_pos, size=0.5)
+            feature = feature[inv]
+        with _nvtx("Enc.conv2"):
+            feature = F.celu(self.conv2(x_in=feature, pos_in=pos, batch_in=voxel_cluster,
+                                        pos_out=pos_sample, batch_out=voxel_cluster_sample,
+                                        in_index=in_index, out_index=out_index))
+        _mem("Enc:after conv2")
 
         pos = pos_sample
         glimpse_member__glimpse_index = glimpse_member_sample__glimpse_index
-
         pos_list.append(pos)
         glimpse_index_list.append(glimpse_member__glimpse_index)
         in_out_index_list.append((in_index, out_index))
 
-        edge_index = radius_graph(pos, 1.0, glimpse_member__glimpse_index, loop=True)
-
+        with _nvtx("Enc.rg_2"):
+            edge_index = radius_graph(pos, 1.0, glimpse_member__glimpse_index, loop=True)
         if self.ar:
-            feature, _, _ = self.ar3(feature, pos, edge_index)
+            with _nvtx("Enc.ar3"):
+                feature, _, _ = self.ar3(feature, pos, edge_index)
         if self.layer_norm:
             feature = self.norm3(feature, glimpse_member__glimpse_index)
 
-        # aggregate all points in one glimpse to the glimpse center with local coordinate (0,0,0)
-        pos_sample = torch.zeros_like(glimpse__center)                                                  
-        glimpse_member_sample__glimpse_index = torch.arange(glimpse__center.size(0), dtype = torch.long, device = pos.device)   # 
-        in_index = torch.arange(pos.size(0), dtype = torch.long, device = pos.device)
+        pos_sample = torch.zeros_like(glimpse__center)
+        glimpse_member_sample__glimpse_index = torch.arange(glimpse__center.size(0), dtype=torch.long, device=pos.device)
+        in_index = torch.arange(pos.size(0), dtype=torch.long, device=pos.device)
         out_index = glimpse_member__glimpse_index
 
-        # # ! Debug:
-        # num_points = scatter_sum(torch.ones(out_index.shape, device=in_index.device), out_index, dim = 0)
-        # assert torch.min(num_points) > 0
-        # assert_sorted_consecutive(in_index)
-        # assert_sorted_consecutive(out_index)
-        # # ! Debug:
-
-        feature = F.celu(self.conv3(x_in = feature, pos_in = pos, batch_in = glimpse_member__glimpse_index, pos_out = pos_sample, batch_out = glimpse_member_sample__glimpse_index, in_index = in_index, out_index = out_index))
-
-        ################################################################################################
+        with _nvtx("Enc.conv3"):
+            feature = F.celu(self.conv3(x_in=feature, pos_in=pos, batch_in=glimpse_member__glimpse_index,
+                                        pos_out=pos_sample, batch_out=glimpse_member_sample__glimpse_index,
+                                        in_index=in_index, out_index=out_index))
+        _mem("Enc:after conv3")
 
         pos_list.append(pos_sample)
         glimpse_index_list.append(glimpse_member_sample__glimpse_index)
         in_out_index_list.append((in_index, out_index))
 
-        out = self.linear(feature)
-
-        mu, sigma = torch.chunk(out, 2, dim = 1)
+        with _nvtx("Enc.linear"):
+            out = self.linear(feature)
+        mu, sigma = torch.chunk(out, 2, dim=1)
 
         what_mask_post = Normal(mu, to_sigma(sigma))
         z_what_mask = what_mask_post.rsample()
-        # z_what_mask = reparameterization(mu, logvar)
-        z_what, z_mask = torch.chunk(z_what_mask, 2, dim = 1)
+        z_what, z_mask = torch.chunk(z_what_mask, 2, dim=1)
 
-        # return z_what, z_mask, log_z_pres, glimpse__logit_pres, what_mask_post, pres_post, pos_list, glimpse_index_list, in_out_index_list
+        _mem("Enc:end")
         return z_what, z_mask, what_mask_post, pos_list, glimpse_index_list, in_out_index_list, feature
 
-class SPAIRGlimpseZPresGenerator(torch.nn.Module):
 
+class SPAIRGlimpseZPresGenerator(torch.nn.Module):
     def __init__(self, cfg):
         super().__init__()
-
         self.radius_max = cfg.max_radius
         self.layer_norm = cfg.glimpse_encoder_ln
 
         self.z_pres_linear = torch.nn.Linear(in_features = 8, out_features = 1)
-
         self.ar1 = AutoRegistrationLayer(x_dim = 256, f_hidden = 128, f_out = 64, g_hidden = 64, g_out = 64)
-        self.ar2 = AutoRegistrationLayer(x_dim = 64, f_hidden = 32, f_out = 32, g_hidden = 32, g_out = 32)
-        self.ar3 = AutoRegistrationLayer(x_dim = 32, f_hidden = 16, f_out = 16, g_hidden = 16, g_out = 8)
+        self.ar2 = AutoRegistrationLayer(x_dim = 64,  f_hidden = 32,  f_out = 32, g_hidden = 32, g_out = 32)
+        self.ar3 = AutoRegistrationLayer(x_dim = 32,  f_hidden = 16,  f_out = 16, g_hidden = 16, g_out = 8)
 
-    def forward(self, glimpse__feature, glimpse__center, glimpse__batch, glimpse_member__local_pos, glimpse_member__log_mask, glimpse_member__glimpse_index, temperature):
+    def forward(self, glimpse__feature, glimpse__center, glimpse__batch,
+                glimpse_member__local_pos, glimpse_member__log_mask,
+                glimpse_member__glimpse_index, temperature):
+        _mem("ZPres:start")
 
-        glimpse_member__normalized_mask = torch.exp(scatter_log_softmax(glimpse_member__log_mask, index = glimpse_member__glimpse_index, dim = 0))
+        glimpse_member__normalized_mask = torch.exp(
+            scatter_log_softmax(glimpse_member__log_mask, index=glimpse_member__glimpse_index, dim=0)
+        )
         glimpse_member__weighted_pos = glimpse_member__local_pos * glimpse_member__normalized_mask
-        glimpse__member_center = scatter_sum(glimpse_member__weighted_pos, glimpse_member__glimpse_index, dim = 0)
+        glimpse__member_center = scatter_sum(glimpse_member__weighted_pos, glimpse_member__glimpse_index, dim=0)
 
         glimpse__center_local_scale = glimpse__center / self.radius_max
 
-        edge_index = radius_graph(glimpse__center_local_scale, 1, glimpse__batch, loop=True)
-        
-        z_pres_feature, _, _ = self.ar1(glimpse__feature, glimpse__center_local_scale, edge_index)
-        z_pres_feature, _, _ = self.ar2(z_pres_feature, glimpse__center_local_scale, edge_index)
-        z_pres_feature, _, _ = self.ar3(z_pres_feature, glimpse__center_local_scale, edge_index)
+        with _nvtx("ZPres.rg"):
+            edge_index = radius_graph(glimpse__center_local_scale, 1, glimpse__batch, loop=True)
+        with _nvtx("ZPres.ar1-3"):
+            z_pres_feature, _, _ = self.ar1(glimpse__feature, glimpse__center_local_scale, edge_index)
+            z_pres_feature, _, _ = self.ar2(z_pres_feature, glimpse__center_local_scale, edge_index)
+            z_pres_feature, _, _ = self.ar3(z_pres_feature, glimpse__center_local_scale, edge_index)
 
         glimpse__logit_pres = self.z_pres_linear(z_pres_feature).squeeze(1)
         glimpse__logit_pres = 8.8 * torch.tanh(glimpse__logit_pres)
-        pres_post = Bernoulli(logits = glimpse__logit_pres)
-        log_z_pres = F.logsigmoid(LogitRelaxedBernoulli(logits=glimpse__logit_pres, temperature=temperature).rsample())
-
+        pres_post = Bernoulli(logits=glimpse__logit_pres)
+        log_z_pres = F.logsigmoid(
+            LogitRelaxedBernoulli(logits=glimpse__logit_pres, temperature=temperature).rsample()
+        )
+        _mem("ZPres:end")
         return log_z_pres, glimpse__logit_pres, pres_post, glimpse__member_center
+
 
 class SPAIRGlimpseZPresMLP(torch.nn.Module):
-    
     def __init__(self, cfg) -> None:
         super().__init__()
-
         self.z_pres_linear = torch.nn.Linear(in_features = 256, out_features = 1)
-    
-    def forward(self, glimpse__feature, glimpse_member__local_pos, glimpse_member__log_mask, glimpse_member__glimpse_index, temperature):
 
-        glimpse_member__normalized_mask = torch.exp(scatter_log_softmax(glimpse_member__log_mask, index = glimpse_member__glimpse_index, dim = 0))
+    def forward(self, glimpse__feature, glimpse_member__local_pos, glimpse_member__log_mask, glimpse_member__glimpse_index, temperature):
+        _mem("ZPresMLP:start")
+        glimpse_member__normalized_mask = torch.exp(
+            scatter_log_softmax(glimpse_member__log_mask, index=glimpse_member__glimpse_index, dim=0)
+        )
         glimpse_member__weighted_pos = glimpse_member__local_pos * glimpse_member__normalized_mask
-        glimpse__member_center = scatter_sum(glimpse_member__weighted_pos, glimpse_member__glimpse_index, dim = 0)
-        
+        glimpse__member_center = scatter_sum(glimpse_member__weighted_pos, glimpse_member__glimpse_index, dim=0)
+
         glimpse__logit_pres = self.z_pres_linear(glimpse__feature).squeeze(1)
         glimpse__logit_pres = 8.8 * torch.tanh(glimpse__logit_pres)
-        pres_post = Bernoulli(logits = glimpse__logit_pres)
-        log_z_pres = F.logsigmoid(LogitRelaxedBernoulli(logits=glimpse__logit_pres, temperature=temperature).rsample())
-
+        pres_post = Bernoulli(logits=glimpse__logit_pres)
+        log_z_pres = F.logsigmoid(
+            LogitRelaxedBernoulli(logits=glimpse__logit_pres, temperature=temperature).rsample()
+        )
+        _mem("ZPresMLP:end")
         return log_z_pres, glimpse__logit_pres, pres_post, glimpse__member_center
 
-class SPAIRGlimpseMaskDecoder(torch.nn.Module):
 
+class SPAIRGlimpseMaskDecoder(torch.nn.Module):
     def __init__(self, cfg):
         super().__init__()
-
-        self.conv1 = PointConv(1, max_num_neighbors = 64, c_in = 64, c_mid = 64, c_out = 32)
+        self.conv1 = PointConv(1,   max_num_neighbors = 64, c_in = 64, c_mid = 64, c_out = 32)
         self.conv2 = PointConv(0.5, max_num_neighbors = 64, c_in = 32, c_mid = 16, c_out = 16)
-        self.conv3 = PointConv(0.25, max_num_neighbors = 64, c_in = 16, c_mid = 8, c_out = 8)
-            
+        self.conv3 = PointConv(0.25,max_num_neighbors = 64, c_in = 16, c_mid = 8,  c_out = 8)
         self.linear = torch.nn.Linear(in_features = 8, out_features = 1)
 
     def forward(self, z_mask, pos_list, glimpse_index_list, in_out_index_list):
-
-        # TODO: get in_index and out_index from encoder for decoding.
-
+        _mem("MaskDec:start")
         (in_index, out_index) = in_out_index_list[-1]
-
-        out = F.celu(self.conv1(x_in = z_mask, pos_in = pos_list[-1], batch_in = glimpse_index_list[-1], pos_out = pos_list[-2], batch_out = glimpse_index_list[-2], in_index = out_index, out_index = in_index))
+        with _nvtx("MaskDec.conv1"):
+            out = F.celu(self.conv1(x_in=z_mask, pos_in=pos_list[-1], batch_in=glimpse_index_list[-1],
+                                    pos_out=pos_list[-2], batch_out=glimpse_index_list[-2],
+                                    in_index=out_index, out_index=in_index))
+        _mem("MaskDec:after conv1")
 
         (in_index, out_index) = in_out_index_list[-2]
-
-        out = F.celu(self.conv2(out, pos_list[-2], glimpse_index_list[-2], pos_list[-3], glimpse_index_list[-3], in_index = out_index, out_index = in_index))
+        with _nvtx("MaskDec.conv2"):
+            out = F.celu(self.conv2(out, pos_list[-2], glimpse_index_list[-2],
+                                    pos_list[-3], glimpse_index_list[-3],
+                                    in_index=out_index, out_index=in_index))
+        _mem("MaskDec:after conv2")
 
         (in_index, out_index) = in_out_index_list[-3]
-
-        out = F.celu(self.conv3(out, pos_list[-3], glimpse_index_list[-3], pos_list[-4], glimpse_index_list[-4], in_index = out_index, out_index = in_index))
-
-        out = self.linear(out)
-
+        with _nvtx("MaskDec.conv3"):
+            out = F.celu(self.conv3(out, pos_list[-3], glimpse_index_list[-3],
+                                    pos_list[-4], glimpse_index_list[-4],
+                                    in_index=out_index, out_index=in_index))
+        with _nvtx("MaskDec.linear"):
+            out = self.linear(out)
         out = F.logsigmoid(out)
-
+        _mem("MaskDec:end")
         return out
 
-class SPAIRGlimpseRGBDecoder(torch.nn.Module):
 
+class SPAIRGlimpseRGBDecoder(torch.nn.Module):
     def __init__(self):
         super().__init__()
-
-        self.conv1 = PointConv(1, max_num_neighbors = 64, c_in = 128, c_mid = 128, c_out = 64)
-        self.conv2 = PointConv(0.5, max_num_neighbors = 64, c_in = 64, c_mid = 32, c_out = 32)
-        self.conv3 = PointConv(0.25, max_num_neighbors = 64, c_in = 32, c_mid = 16, c_out = 16)
-
+        self.conv1 = PointConv(1,   max_num_neighbors = 64, c_in = 128, c_mid = 128, c_out = 64)
+        self.conv2 = PointConv(0.5, max_num_neighbors = 64, c_in = 64,  c_mid = 32,  c_out = 32)
+        self.conv3 = PointConv(0.25,max_num_neighbors = 64, c_in = 32,  c_mid = 16,  c_out = 16)
         self.linear = torch.nn.Linear(in_features = 16, out_features = 3)
 
     def forward(self, z_what, pos_list, glimpse_index_list):
-
-        out = F.celu(self.conv1(z_what, pos_list[-1], glimpse_index_list[-2]))
-
-        out = F.celu(self.conv2(out, pos_list[-2], glimpse_index_list[-3]))
-
-        out = F.celu(self.conv3(out, pos_list[-3], glimpse_index_list[-4]))
-
-        out = self.linear(out)
-
+        _mem("RGBDec:start")
+        with _nvtx("RGBDec.conv1"):
+            out = F.celu(self.conv1(z_what, pos_list[-1], glimpse_index_list[-2]))
+        with _nvtx("RGBDec.conv2"):
+            out = F.celu(self.conv2(out, pos_list[-2], glimpse_index_list[-3]))
+        with _nvtx("RGBDec.conv3"):
+            out = F.celu(self.conv3(out, pos_list[-3], glimpse_index_list[-4]))
+        with _nvtx("RGBDec.linear"):
+            out = self.linear(out)
+        _mem("RGBDec:end")
         return out
+
 
 class SPAIRPointPosDecoder(torch.nn.Module):
     def __init__(self, latent_size = 128, num_points = 1024):
         super().__init__()
-
-        # ! for clouds with the same number of points only
-
         self.num_points = num_points
-
         self.fc1 = torch.nn.Linear(in_features = latent_size, out_features = 256)
         self.fc2 = torch.nn.Linear(in_features = 256, out_features = 512)
         self.fc3 = torch.nn.Linear(in_features = 512, out_features = 1024)
-        self.fc4 = torch.nn.Linear(in_features = 1024, out_features = num_points * 3) # xyz mask
+        self.fc4 = torch.nn.Linear(in_features = 1024, out_features = num_points * 3)
 
-    def forward(self, z, glimpse_index, center_flag = True):  # n_glimpse, latent_size    n_glimpse
-
+    def forward(self, z, glimpse_index, center_flag = True):
+        _mem("PosDec:start")
         x = F.celu(self.fc1(z))
-
         x = F.celu(self.fc2(x))
-
         x = F.celu(self.fc3(x))
-
         x = self.fc4(x)
+        x = x.view(x.shape[0], -1, 3)
 
-        x = x.view(x.shape[0], -1, 3) # n_glimpse, num_points, 3
-
-        # center generated points
         if center_flag:
             x_center = torch.mean(x, dim=1, keepdim=True)
             x = x - x_center
 
         glimpse_index = glimpse_index.unsqueeze(1).repeat(1, self.num_points)
-
-        # x = x.view(-1, 3)
-        # pos_glimpse_index = pos_glimpse_index.view(-1)
-
-        x = torch.cat(list(x), dim = 0)
-        pos_predict_glimpse_index = torch.cat(list(glimpse_index), dim = 0)
-
+        x = torch.cat(list(x), dim=0)
+        pos_predict_glimpse_index = torch.cat(list(glimpse_index), dim=0)
+        _mem("PosDec:end")
         return x, pos_predict_glimpse_index
+
 
 class SPAIRPointPosFlow(torch.nn.Module):
     def __init__(self, latent_size = 128, layer_norm = False):
         super().__init__()
-        # * when the number of points in one glimpse is low, radius graph cannot guarantee that all nodes are connected.
-
         self.ar1 = AutoRegistrationLayer(x_dim = 3 + latent_size, f_hidden = 128, f_out = 128, g_hidden = 128, g_out = 64 + 3, end_relu=False)
-        self.ar2 = AutoRegistrationLayer(x_dim = 64, f_hidden = 64, f_out = 64, g_hidden = 64, g_out = 32 + 3, end_relu=False)
-        self.ar3 = AutoRegistrationLayer(x_dim = 32, f_hidden = 16, f_out = 16, g_hidden = 16, g_out = 3, end_relu=False)
+        self.ar2 = AutoRegistrationLayer(x_dim = 64,             f_hidden = 64,  f_out = 64,  g_hidden = 64,  g_out = 32 + 3, end_relu=False)
+        self.ar3 = AutoRegistrationLayer(x_dim = 32,             f_hidden = 16,  f_out = 16,  g_hidden = 16,  g_out = 3,      end_relu=False)
 
         self.layer_norm = layer_norm
-
         if self.layer_norm:
             self.norm1 = LayerNorm(64)
             self.norm2 = LayerNorm(32)
-
         self.noise = None
 
     def forward(self, z, batch, center_flag = True, extra_predict_ratio = 0.25):
-        # expand z to parallel following operation
-
+        _mem("PosFlow:start")
         if self.noise is None:
-            # all glimpse points are inside the ball with radius 1
-            self.noise = Normal(torch.tensor(0.0, device=z.device), torch.tensor(0.3, device = z.device))
+            self.noise = Normal(torch.tensor(0.0, device=z.device), torch.tensor(0.3, device=z.device))
 
         if extra_predict_ratio > 0:
-            
-            prob = torch.ones(batch.size(0), device = batch.device)
+            prob = torch.ones(batch.size(0), device=batch.device)
             sample = torch.multinomial(prob, int(batch.size(0) * extra_predict_ratio))
-            batch = torch.cat((batch, batch[sample]), dim = 0)
+            batch = torch.cat((batch, batch[sample]), dim=0)
 
         z = z[batch]
-
         population = self.noise.sample((batch.size(0), 3))
 
-        edge_index = radius_graph(population, 0.2, batch)
+        with _nvtx("PosFlow.rg1"):
+            edge_index = radius_graph(population, 0.2, batch, loop = True, max_num_neighbors=64)
 
-        feature = torch.cat((z, population), dim = 1)
-
-        feature, _, _ = self.ar1(feature, population, edge_index)
-
-        (feature, population) = torch.split(feature, (64, 3), dim = 1)
-
-        if self.layer_norm:
-            feature = self.norm1(feature)
-
+        feature = torch.cat((z, population), dim=1)
+        with _nvtx("PosFlow.ar1"):
+            feature, _, _ = self.ar1(feature, population, edge_index)
+        feature, population = torch.split(feature, (64, 3), dim=1)
+        if self.layer_norm: feature = self.norm1(feature)
         feature = F.celu(feature)
 
-        edge_index = radius_graph(population, 0.1, batch)
-        
-        feature, _, _ = self.ar2(feature, population, edge_index)
-
-        (feature, population) = torch.split(feature, (32, 3), dim = 1)
-
-        if self.layer_norm:
-            feature = self.norm2(feature)
-
+        with _nvtx("PosFlow.rg2"):
+            edge_index = radius_graph(population, 0.1, batch, loop=True, max_num_neighbors=64)
+        with _nvtx("PosFlow.ar2"):
+            feature, _, _ = self.ar2(feature, population, edge_index)
+        feature, population = torch.split(feature, (32, 3), dim=1)
+        if self.layer_norm: feature = self.norm2(feature)
         feature = F.celu(feature)
 
-        edge_index = radius_graph(population, 0.05, batch)
+        with _nvtx("PosFlow.rg3"):
+            edge_index = radius_graph(population, 0.05, batch, loop=True, max_num_neighbors=64)
+        with _nvtx("PosFlow.ar3"):
+            population, _, _ = self.ar3(feature, population, edge_index)
 
-        population, _, _ = self.ar3(feature, population, edge_index)
-
-        # zero center
         if center_flag:
             population_center = scatter_mean(population, batch, dim=0)
             population = population - population_center[batch]
-        
+
+        _mem("PosFlow:end")
         return population, batch
+
 
 class SPAIRGlimpseVAE(torch.nn.Module):
     def __init__(self, cfg):
-
         super().__init__()
-
         self.no_ZPres_generator = False
         self.generate_z_pres = cfg.generate_z_pres
-        
+
         self.encoder = SPAIRGlimpseEncoder(cfg)
         if self.no_ZPres_generator:
             self.z_pres_mlp = SPAIRGlimpseZPresMLP(cfg)
@@ -571,133 +589,119 @@ class SPAIRGlimpseVAE(torch.nn.Module):
 
         self.extra_predict_ratio = cfg.extra_predict_ratio
         self.no_ZPres_generator = cfg.no_ZPres_generator
-
         self.flow_points_per_glimpse = getattr(cfg, "flow_points_per_glimpse", 64)
+        self.flow_budget = getattr(cfg, "flow_budget", 8192) 
+        self.flow_chunk_glimpses = getattr(cfg, "flow_chunk_glimpses", 64)
 
     def forward(self, rgb, glimpse_member__local_pos, glimpse_member__glimpse_index, glimpse__center, glimpse__batch, temperature):
+        _reset_peak()
+        _shapes("GlimpseVAE.in", local_pos=glimpse_member__local_pos, gidx=glimpse_member__glimpse_index, gcenter=glimpse__center)
+        _mem("GlimpseVAE:start")
 
-        (glimpse__z_what,
-        glimpse__z_mask, 
-        glimpse__what_mask_post,
-        pos_list, 
-        glimpse_index_list, 
-        in_out_index_list,
-        glimpse__feature) = self.encoder(rgb, glimpse_member__local_pos, glimpse_member__glimpse_index, glimpse__center, glimpse__batch)
+        with _nvtx("VAE.encoder"):
+            (glimpse__z_what,
+             glimpse__z_mask,
+             glimpse__what_mask_post,
+             pos_list,
+             glimpse_index_list,
+             in_out_index_list,
+             glimpse__feature) = self.encoder(rgb, glimpse_member__local_pos, glimpse_member__glimpse_index, glimpse__center, glimpse__batch)
+        _mem("VAE:after encoder")
 
-        glimpse_member__log_mask = self.mask_decoder(glimpse__z_mask, pos_list, glimpse_index_list, in_out_index_list)
+        with _nvtx("VAE.mask_decoder"):
+            glimpse_member__log_mask = self.mask_decoder(glimpse__z_mask, pos_list, glimpse_index_list, in_out_index_list)
+        _mem("VAE:after mask_decoder")
 
         if self.no_ZPres_generator:
-            (glimpse__log_z_pres, 
-            glimpse__logit_pres,
-            glimpse__pres_post, 
-            glimpse__member_center) = self.z_pres_mlp(glimpse__feature, 
-                                                        glimpse_member__local_pos,
-                                                        glimpse_member__log_mask, 
-                                                        glimpse_member__glimpse_index,
-                                                        temperature)
+            with _nvtx("VAE.z_pres_mlp"):
+                (glimpse__log_z_pres,
+                 glimpse__logit_pres,
+                 glimpse__pres_post,
+                 glimpse__member_center) = self.z_pres_mlp(glimpse__feature,
+                                                           glimpse_member__local_pos,
+                                                           glimpse_member__log_mask,
+                                                           glimpse_member__glimpse_index,
+                                                           temperature)
         else:
-            (glimpse__log_z_pres, 
-            glimpse__logit_pres,
-            glimpse__pres_post, 
-            glimpse__member_center) = self.z_pres_generator(glimpse__feature, 
-                                                            glimpse__center,
-                                                            glimpse__batch,
-                                                            glimpse_member__local_pos,
-                                                            glimpse_member__log_mask, 
-                                                            glimpse_member__glimpse_index,
-                                                            temperature)
+            with _nvtx("VAE.z_pres_generator"):
+                (glimpse__log_z_pres,
+                 glimpse__logit_pres,
+                 glimpse__pres_post,
+                 glimpse__member_center) = self.z_pres_generator(glimpse__feature,
+                                                                 glimpse__center,
+                                                                 glimpse__batch,
+                                                                 glimpse_member__local_pos,
+                                                                 glimpse_member__log_mask,
+                                                                 glimpse_member__glimpse_index,
+                                                                 temperature)
+        _mem("VAE:after z_pres")
 
-        glimpse__center_diff = torch.norm(glimpse__member_center - glimpse__center, 2, dim = 1)
-        
-        # if rgb is not None:
-        #     rgb_predict = self.rgb_decoder(z_what, pos_list, glimpse_index_list)
-        # else:
-        #     rgb_predict = None
+        glimpse__center_diff = torch.norm(glimpse__member_center - glimpse__center, 2, dim=1)
 
-        # glimpse_predict__pos, glimpse_predict__glimpse_index = self.pos_decoder(z_what, glimpse_index_list[-1])
-        # old, per-point glimpse IDs
+        # Compact glimpse IDs
         old_ids = glimpse_member__glimpse_index.long()
-        uniq_ids, new_ids = torch.unique(old_ids, return_inverse=True, sorted=True)
-
-        if torch.all(old_ids[1:] >= old_ids[:-1]):  # already nondecreasing
+        if torch.all(old_ids[1:] >= old_ids[:-1]):
             uniq_ids, new_ids = torch.unique_consecutive(old_ids, return_inverse=True)
         else:
             uniq_ids, new_ids = torch.unique(old_ids, return_inverse=True, sorted=True)
+        K = uniq_ids.numel()
+        ppg = max(4, min(self.flow_points_per_glimpse, self.flow_budget // max(1, K)))
+        flow_batch = torch.arange(K, device=glimpse__z_what.device).repeat_interleave(ppg)
 
-        K = uniq_ids.numel()                                  # number of glimpses in this batch
-        glimpse__batch_compact = glimpse__batch[uniq_ids]     # shape [K], values in [0..B-1]
-
-        # ---- Flow sampling plan (crucial) ----
-        # choose a safe, fixed number of samples per glimpse; tune if needed
-        points_per_glimpse = getattr(self, "flow_points_per_glimpse", 64)
-
-        print("FLOW POINTS PER GLIMPSE:", points_per_glimpse)
-        flow_batch = torch.arange(K, device=glimpse__z_what.device).repeat_interleave(points_per_glimpse)
-        # keep the flow small/stable; duplication will be handled by repeat_interleave above
-        extra_ratio = 0.0
-
-        glimpse_predict__pos, glimpse_predict__glimpse_index = self.pos_decoder(
-            glimpse__z_what, flow_batch, True, extra_predict_ratio=extra_ratio
-        )
-
-        # glimpse_predict__pos, glimpse_predict__glimpse_index = self.pos_decoder(
-        #     glimpse__z_what, new_ids, True, extra_predict_ratio=self.extra_predict_ratio
-        # )
-
-        # glimpse_predict__pos = torch.tanh(glimpse_predict__pos) # generated points must live in unit ball/cube
+        with _nvtx("VAE.pos_decoder"):
+            glimpse_predict__pos, glimpse_predict__glimpse_index = self.pos_decoder(
+                glimpse__z_what, flow_batch, True, extra_predict_ratio=0.0
+            )
+        _mem("VAE:end")
 
         return (glimpse__z_what,
                 glimpse__z_mask,
-                glimpse__log_z_pres, 
-                glimpse__logit_pres, 
-                glimpse_member__log_mask, 
-                None, 
-                glimpse_predict__pos, 
-                glimpse_predict__glimpse_index, 
-                glimpse__what_mask_post, 
-                glimpse__pres_post, 
+                glimpse__log_z_pres,
+                glimpse__logit_pres,
+                glimpse_member__log_mask,
+                None,
+                glimpse_predict__pos,
+                glimpse_predict__glimpse_index,
+                glimpse__what_mask_post,
+                glimpse__pres_post,
                 glimpse__center_diff)
 
-class CoarseEncoder(torch.nn.Module):
 
+class CoarseEncoder(torch.nn.Module):
     def __init__(self):
         super().__init__()
-
         self.conv1 = PointConv(10, max_num_neighbors = 64, c_in = 256, c_mid = 256, c_out = 512)
 
     def forward(self, pos, feature, batch):
-
-        pos_center = scatter_mean(pos, batch, dim = 0)
+        _mem("CoarseEnc:start")
+        pos_center = scatter_mean(pos, batch, dim=0)
         pos_center_batch = torch.arange(pos_center.size(0), dtype=torch.long, device=pos.device)
-
-        _index = torch.arange(pos.size(0), dtype=torch.long, device=pos.device) # !
-
+        _index = torch.arange(pos.size(0), dtype=torch.long, device=pos.device)
         assert torch.max(_index) == (feature.size(0) - 1), "CoarseEncoder assertion triggered"
 
-        out = self.conv1(x_in = feature, pos_in = pos, batch_in = batch, pos_out = pos_center, batch_out = pos_center_batch, in_index = _index, out_index = batch)
-
-        mu, sigma = torch.chunk(out, 2, dim = 1) # B * N, 256
-
+        with _nvtx("CoarseEnc.conv1"):
+            out = self.conv1(x_in=feature, pos_in=pos, batch_in=batch,
+                             pos_out=pos_center, batch_out=pos_center_batch,
+                             in_index=_index, out_index=batch)
+        mu, sigma = torch.chunk(out, 2, dim=1)
         what_coarse_post = Normal(mu, to_sigma(sigma))
-
         z_what_coarse = what_coarse_post.rsample()
-
+        _mem("CoarseEnc:end")
         return z_what_coarse, what_coarse_post, pos_center_batch
 
-class CoarseVAE(torch.nn.Module):
 
+class CoarseVAE(torch.nn.Module):
     def __init__(self):
         super().__init__()
-
         self.encoder = CoarseEncoder()
         self.decoder = SPAIRPointPosFlow(latent_size = 256)
 
     def forward(self, voxel__pos, voxel__feature, voxel__batch, batch):
-
-        # voxel__feature = voxel__feature.detach()
-
-        z_what_coarse, what_coarse_post, pos_center_batch = self.encoder(voxel__pos, voxel__feature, voxel__batch)
-
-        coarse_point_predict, pos_predict_batch = self.decoder(z_what_coarse, batch, False)
-
+        _reset_peak()
+        _mem("CoarseVAE:start")
+        with _nvtx("CoarseVAE.encoder"):
+            z_what_coarse, what_coarse_post, pos_center_batch = self.encoder(voxel__pos, voxel__feature, voxel__batch)
+        with _nvtx("CoarseVAE.decoder"):
+            coarse_point_predict, pos_predict_batch = self.decoder(z_what_coarse, batch, False, extra_predict_ratio=0.0)
+        _mem("CoarseVAE:end")
         return coarse_point_predict, pos_predict_batch, what_coarse_post
