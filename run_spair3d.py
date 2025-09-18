@@ -244,6 +244,9 @@ def main():
     optimizer = torch.optim.Adam(param_groups_no_decay(model), lr=lr, amsgrad=True)
     # optimizer = torch.optim.Adam(model.parameters(), lr=lr, amsgrad=True)
 
+    use_amp = True
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+
     iter_idx = 0
     writer = SummaryWriter(logdir) if is_master else None
 
@@ -262,6 +265,7 @@ def main():
     train_iters = getattr(config, "train_iter", getattr(config, "train", {}).get("iter", 100000))
 
     while iter_idx < train_iters:
+        print("++++++++++Iteration ", iter_idx, "+++++++++++++++++")
         for batch_data in train_loader:
             if iter_idx >= train_iters:
                 break
@@ -324,10 +328,19 @@ def main():
 
             NLL = NLL_forward + NLL_backward
             loss = NLL + DKL
-            loss.backward()
 
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=getattr(config, "grad_max_norm", 1.0))
-            optimizer.step()
+            print("STARTING BACKWARD")
+            scaler.scale(loss).backward()          # replaces loss.backward()
+            # Unscale BEFORE clipping so clipping sees real grads
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(),
+                                        max_norm=getattr(config, "grad_max_norm", 1.0))
+
+            # Single step with the scaler
+            scaler.step(optimizer)
+            scaler.update()
+
+            print("FINISHED UPDATE")
 
             # TensorBoard (rank 0 only)
             if is_master and (iter_idx % config.tfb_update_every) == 0:
