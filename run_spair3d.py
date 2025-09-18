@@ -10,8 +10,7 @@ from forge.experiment_tools import fprint
 
 import torch
 from torch.utils.tensorboard import SummaryWriter
-from torch.utils.data import DataLoader, DistributedSampler
-from torch.distributed import init_process_group, destroy_process_group, is_initialized
+from torch.utils.data import DataLoader
 
 from models.utils import compute_performance, batch_statistic
 from datasets.to_dataset import make_ply_dataset  # your PLY-based dataset factory
@@ -50,7 +49,7 @@ def merge_train_overrides(cfg):
         if "lr" in tr: cfg.lr = tr["lr"]
         if "iter" in tr: cfg.train_iter = tr["iter"]
 
-# ---------- Flags ----------
+# ---------- Flags (single-GPU) ----------
 def main_flags():
     flags.DEFINE_string('config', None, 'Path to JSON config (required).')
     flags.DEFINE_boolean('resume', False, 'Resume if True.')
@@ -65,23 +64,10 @@ def main_flags():
     # safe defaults (overridable by JSON)
     flags.DEFINE_string('results_dir', osp.join(os.path.expanduser("~"), "checkpoints", "SPAIR3D"), 'Results root.')
     flags.DEFINE_string('run_name', 'run', 'Run folder name.')
-    flags.DEFINE_boolean('multi_gpu', True, 'Use DDP if launcher provided ranks.')
     flags.DEFINE_string('data_config', 'datasets/unity_object_room.py', 'Data cfg file.')
     flags.DEFINE_string('model_config', 'models/SS3D.py', 'Model cfg file.')
     flags.DEFINE_integer('batch_size', 1, 'Batch size.')
     flags.DEFINE_float('grad_max_norm', 1.0, 'Grad clip norm.')
-
-    # tolerated by torch.distributed.launch/torchrun
-    flags.DEFINE_integer('local_rank', 0, 'DDP local rank (injected by launcher).')
-
-def ddp_setup(local_rank_flag=0):
-    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
-        init_process_group(backend="nccl", init_method="env://")
-        local_rank = int(os.environ.get("LOCAL_RANK", local_rank_flag))
-        torch.cuda.set_device(local_rank)
-        return local_rank, int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"])
-    else:
-        return 0, 0, 1
 
 # ---- Helpers for batch canonicalization ----
 def _pick(d: dict, names):
@@ -91,18 +77,16 @@ def _pick(d: dict, names):
     return None
 
 def _ensure_batch_from_lengths(lengths, device):
-    # build [0,0,...,1,1,...,B-1,...] based on per-sample point counts
     pieces = [torch.full((int(L),), i, dtype=torch.long, device=device) for i, L in enumerate(lengths)]
     return torch.cat(pieces, dim=0) if pieces else torch.empty(0, dtype=torch.long, device=device)
 
 def _ensure_batch_from_pos(pos, device):
-    # single-sample fallback (batch_size==1 per GPU is common in DDP)
     N = pos.size(0)
     return torch.zeros(N, dtype=torch.long, device=device)
 
 def _canonicalize_pos_batch(pos, bidx, device, log_prefix=""):
     """
-    Make sure pos is [N,3] float32 contiguous and batch is int64 [N] on same device.
+    Ensure pos is [N,3] float32 contiguous and batch is int64 [N] on same device.
     Accepts pos as [B,N,3], [N,3], [3,N], or flat [3N].
     Accepts batch as None, [N], or [B,N].
     """
@@ -110,20 +94,17 @@ def _canonicalize_pos_batch(pos, bidx, device, log_prefix=""):
         pos = torch.as_tensor(pos)
     pos = pos.to(device=device, dtype=torch.float32, non_blocking=True)
 
-    # Handle shapes
     if pos.dim() == 3 and pos.size(-1) == 3:
         B, N, _ = pos.shape
         pos = pos.reshape(B * N, 3).contiguous()
         if bidx is None:
             bidx = _ensure_batch_from_lengths([N] * B, device)
     elif pos.dim() == 2:
-        # [N,3] or [3,N]
         if pos.size(1) == 3:
             pos = pos.contiguous()
         elif pos.size(0) == 3:
             pos = pos.t().contiguous()
         else:
-            # If 2D but not 3 in either dimension, try to guess flat points
             raise ValueError(f"{log_prefix}pos has unexpected 2D shape {tuple(pos.shape)}; expected [N,3] or [3,N].")
     elif pos.dim() == 1 and (pos.numel() % 3 == 0):
         pos = pos.view(-1, 3).contiguous()
@@ -132,18 +113,16 @@ def _canonicalize_pos_batch(pos, bidx, device, log_prefix=""):
 
     N = pos.size(0)
 
-    # batch index
     if bidx is None:
         bidx = _ensure_batch_from_pos(pos, device)
     elif isinstance(bidx, torch.Tensor):
         bidx = bidx.to(device=device, dtype=torch.long, non_blocking=True)
-        if bidx.dim() == 2:  # e.g., [B,N]
+        if bidx.dim() == 2:
             bidx = bidx.reshape(-1)
     else:
         bidx = torch.as_tensor(bidx, dtype=torch.long, device=device)
 
     if bidx.numel() != N:
-        # If per-sample lengths are deducible, rebuild; otherwise error
         raise ValueError(f"{log_prefix}batch length {bidx.numel()} != num points {N}")
 
     return pos, bidx
@@ -151,7 +130,6 @@ def _canonicalize_pos_batch(pos, bidx, device, log_prefix=""):
 # ---- Batch extractor (dict, tuple/list, or PyG Batch-like) ----
 def extract_batch(batch_data):
     """Return (pos, rgb, batch_idx, Id, layer). May create batch_idx if missing."""
-    # Dict batches
     if isinstance(batch_data, dict):
         pos   = _pick(batch_data, ['pos', 'xyz', 'points'])
         rgb   = _pick(batch_data, ['rgb', 'color', 'colors'])
@@ -162,7 +140,6 @@ def extract_batch(batch_data):
             raise KeyError(f"Batch dict missing 'pos' (available keys: {list(batch_data.keys())})")
         return pos, rgb, bidx, Id, layer
 
-    # Tuple/list batches
     if isinstance(batch_data, (list, tuple)):
         if len(batch_data) < 1:
             raise KeyError(f"Tuple/list batch too short; got len={len(batch_data)}")
@@ -173,7 +150,6 @@ def extract_batch(batch_data):
         layer = batch_data[4] if len(batch_data) > 4 else None
         return pos, rgb, bidx, Id, layer
 
-    # PyG Batch or similar object with attributes
     if hasattr(batch_data, "pos"):
         pos   = getattr(batch_data, "pos")
         rgb   = getattr(batch_data, "rgb", None)
@@ -197,36 +173,27 @@ def main():
     merge_train_overrides(config)
     fprint(f"Loaded JSON config from {config.config} and applied overrides.")
 
-    # DDP init (after flags parsed so local_rank is known)
-    local_rank, global_rank, world_size = ddp_setup(config.local_rank)
-    device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
-    is_master = (global_rank == 0)
+    # Device: single GPU (or CPU fallback)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    is_master = True  # single-process run
 
     # ==== Checkpoints & logging ====
     run_root = osp.join(config.results_dir, config.run_name)
-    if is_master:
-        logdir, resume_checkpoint = fet.init_checkpoint(
-            run_root,
-            config.data_config,
-            config.model_config,
-            ["models/submodels/spair3d_modules.py"],
-            config.resume
-        )
-        merged_out = osp.join(logdir, "config.merged.json")
-        try:
-            with open(merged_out, "w") as f:
-                json.dump(user_cfg, f, indent=2, sort_keys=True)
-            fprint(f"Wrote merged config -> {merged_out}")
-        except Exception as e:
-            fprint(f"[warn] failed to write merged config: {e}")
-        os.makedirs(osp.join(logdir, 'dash_data'), exist_ok=True)
-    else:
-        logdir = run_root
-        os.makedirs(logdir, exist_ok=True)
-        resume_checkpoint = None
-
-    if is_initialized():
-        torch.distributed.barrier()
+    logdir, resume_checkpoint = fet.init_checkpoint(
+        run_root,
+        config.data_config,
+        config.model_config,
+        ["models/submodels/spair3d_modules.py"],
+        config.resume
+    )
+    merged_out = osp.join(logdir, "config.merged.json")
+    try:
+        with open(merged_out, "w") as f:
+            json.dump(user_cfg, f, indent=2, sort_keys=True)
+        fprint(f"Wrote merged config -> {merged_out}")
+    except Exception as e:
+        fprint(f"[warn] failed to write merged config: {e}")
+    os.makedirs(osp.join(logdir, 'dash_data'), exist_ok=True)
 
     checkpoint_name = osp.join(logdir, 'model.ckpt')
     dash_logdir = osp.join(logdir, 'dash_data')
@@ -245,34 +212,17 @@ def main():
     train_ds = make_ply_dataset(ds_root, "train", ds_norm, ds_max_points, ds_instance_field)
     val_ds   = make_ply_dataset(ds_root, "val",   ds_norm, ds_max_points, ds_instance_field)
 
-    if world_size > 1:
-        train_sampler = DistributedSampler(train_ds, num_replicas=world_size, rank=global_rank, shuffle=True, drop_last=True)
-        val_sampler   = DistributedSampler(val_ds,   num_replicas=world_size, rank=global_rank, shuffle=False, drop_last=False)
-    else:
-        train_sampler = None
-        val_sampler   = None
-
     train_loader = DataLoader(
-        train_ds, batch_size=ds_batch_size, sampler=train_sampler, shuffle=(train_sampler is None),
+        train_ds, batch_size=ds_batch_size, shuffle=True,
         num_workers=ds_num_workers, pin_memory=True, persistent_workers=(ds_num_workers > 0)
     )
     val_loader = DataLoader(
-        val_ds, batch_size=ds_batch_size, sampler=val_sampler, shuffle=False,
+        val_ds, batch_size=ds_batch_size, shuffle=False,
         num_workers=ds_num_workers, pin_memory=True, persistent_workers=(ds_num_workers > 0)
     )
 
     # ==== Model & Optimizer ====
     model = fet.load(config.model_config, config).to(device)
-
-    if world_size > 1:
-        model = torch.nn.parallel.DistributedDataParallel(
-            model,
-            device_ids=[local_rank],
-            output_device=local_rank,
-            find_unused_parameters=True,       # <-- key fix for dynamic graphs
-            gradient_as_bucket_view=True,      # small perf/mem win on recent PyTorch
-        )
-
 
     lr = getattr(config, 'lr', 1e-4)  # from train.lr if provided
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, amsgrad=True)
@@ -283,24 +233,18 @@ def main():
     if resume_checkpoint is not None:
         fprint(f"Restoring checkpoint from {resume_checkpoint}")
         checkpoint = torch.load(resume_checkpoint, map_location='cpu')
-        target = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
-        target.load_state_dict(checkpoint['model_state_dict'])
+        model.load_state_dict(checkpoint['model_state_dict'])
         optimizer.load_state_dict(checkpoint['optimiser_state_dict'])
         iter_idx = checkpoint['iter_idx'] + 1
 
-    (model.module if hasattr(model, "module") else model).iter = iter_idx
+    model.iter = iter_idx
     if is_master:
         fprint(f"Starting training at iter = {iter_idx}")
-    if train_sampler is not None:
-        train_sampler.set_epoch(0)
 
     model.train()
     train_iters = getattr(config, "train_iter", getattr(config, "train", {}).get("iter", 100000))
 
     while iter_idx < train_iters:
-        if train_sampler is not None:
-            train_sampler.set_epoch(iter_idx // max(1, len(train_loader)))
-
         for batch_data in train_loader:
             if iter_idx >= train_iters:
                 break
@@ -407,11 +351,10 @@ def main():
             if is_master and (iter_idx % config.ckpt_freq) == 0:
                 ckpt_file = f'{checkpoint_name}-{iter_idx}'
                 fprint(f"Saving model training checkpoint to: {ckpt_file}")
-                target = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
                 torch.save(
                     {
                         'iter_idx': iter_idx,
-                        'model_state_dict': target.state_dict(),
+                        'model_state_dict': model.state_dict(),
                         'optimiser_state_dict': optimizer.state_dict(),
                         'elbo': loss.item()
                     },
@@ -423,8 +366,6 @@ def main():
 
     if is_master and writer is not None:
         writer.close()
-    if is_initialized():
-        destroy_process_group()
 
 if __name__ == "__main__":
     main()
