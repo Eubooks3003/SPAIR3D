@@ -51,6 +51,16 @@ def _shapes(tag: str, **tensors):
                 parts.append(f"{k}={type(v).__name__}")
         print(f"[SHAPE] {tag}: " + ", ".join(parts))
 
+def _assert_finite(tag, *tensors):
+    for t in tensors:
+        if t is None: 
+            continue
+        if not torch.isfinite(t).all():
+            bad = (~torch.isfinite(t)).nonzero(as_tuple=False)[:5]
+            print(f"[NaN/Inf] {tag}: found {bad.shape[0]} bad values; first idx: {bad.flatten().tolist()[:10]}")
+            return False
+    return True
+
 @contextmanager
 def _nvtx(name: str):
     if _ENABLE_NVTX and torch.cuda.is_available():
@@ -75,6 +85,9 @@ class SPAIRPointFeatureNetwork(torch.nn.Module):
 
     def forward(self, pos, rgb, batch):
         _shapes("PointFeat.in", pos=pos, batch=batch)
+
+        _assert_finite("PointFeat.pos ", pos)
+        _assert_finite("PointFeat.batch ", batch)
         _mem("PointFeat:start")
         with _nvtx("PointFeat.radius_graph"):
             out_index, in_index = radius_graph(pos, self.radius, batch, loop=True,
@@ -85,16 +98,33 @@ class SPAIRPointFeatureNetwork(torch.nn.Module):
             out = F.celu(self.conv1(pos, pos, batch, in_index=in_index, out_index=out_index))
         _mem("PointFeat:after conv1")
 
+        self._assert_finite("PointFeat: After Conv1 ", out)
+
         with _nvtx("PointFeat.conv2"):
             out = F.celu(self.conv2(out, pos, batch, in_index=in_index, out_index=out_index))
         _mem("PointFeat:after conv2")
+
+        self._assert_finite("PointFeat: After Conv2 ", out)
+
 
         with _nvtx("PointFeat.conv3"):
             out = F.celu(self.conv3(out, pos, batch, in_index=in_index, out_index=out_index))
         _mem("PointFeat:end")
 
+        self._assert_finite("PointFeat: End ", out)
+
+
         return pos, out, batch
 
+    def _assert_finite(self, tag, *tensors):
+        for t in tensors:
+            if t is None: 
+                continue
+            if not torch.isfinite(t).all():
+                bad = (~torch.isfinite(t)).nonzero(as_tuple=False)[:5]
+                print(f"[NaN/Inf] {tag}: found {bad.shape[0]} bad values; first idx: {bad.flatten().tolist()[:10]}")
+                return False
+        return True
 
 class SPAIRGridFeatureNetwork(torch.nn.Module):
     def __init__(self, cfg):
@@ -131,6 +161,7 @@ class SPAIRGridFeatureNetwork(torch.nn.Module):
         _shapes("GridFeat.in", pos=pos, feature=feature, batch=batch)
         _mem("GridFeat:start")
 
+        self._assert_finite("Grid Feat Starting", feature)
         max_pos, _ = torch.max(pos, dim=0)
         min_pos, _ = torch.min(pos, dim=0)
         noise = torch.rand_like(min_pos) * (1/8)
@@ -139,6 +170,11 @@ class SPAIRGridFeatureNetwork(torch.nn.Module):
         with _nvtx("GridFeat.voxel_pool_0"):
             (out_index, in_index), pos, batch, pos_sample, batch_sample, voxel_cluster, voxel_cluster_sample, inv = \
                 voxel_mean_pool(pos=pos, batch=batch, start=min_pos, end=max_pos, size=0.5 / 16)
+            num_pts = scatter_sum(
+                torch.ones_like(out_index, dtype=torch.long),
+                out_index, dim=0, dim_size=pos_sample.size(0)
+            )
+            assert (num_pts > 0).all(), "Empty cluster detected before next PointConv"
             feature = feature[inv]
         _shapes("GridFeat.pool0", pos=pos, pos_sample=pos_sample, feature=feature)
         _mem("GridFeat:after pool0")
@@ -149,6 +185,7 @@ class SPAIRGridFeatureNetwork(torch.nn.Module):
                                         in_index=in_index, out_index=out_index))
         _mem("GridFeat:after conv1")
 
+        self._assert_finite("GridFeat.after conv1", feature)
         pos = pos_sample
         batch = batch_sample
 
@@ -163,6 +200,12 @@ class SPAIRGridFeatureNetwork(torch.nn.Module):
         with _nvtx("GridFeat.voxel_pool_1"):
             (out_index, in_index), pos, batch, pos_sample, batch_sample, voxel_cluster, voxel_cluster_sample, inv = \
                 voxel_mean_pool(pos=pos, batch=batch, start=min_pos, end=max_pos, size=1 / 16)
+            num_pts = scatter_sum(
+                torch.ones_like(out_index, dtype=torch.long),
+                out_index, dim=0, dim_size=pos_sample.size(0)
+            )
+            assert (num_pts > 0).all(), "Empty cluster detected before next PointConv"
+            
             feature = feature[inv]
         _mem("GridFeat:after pool1")
 
@@ -172,6 +215,7 @@ class SPAIRGridFeatureNetwork(torch.nn.Module):
                                         in_index=in_index, out_index=out_index))
         _mem("GridFeat:after conv2")
 
+        self._assert_finite("GridFeat.after conv2", feature)
         pos = pos_sample
         batch = batch_sample
 
@@ -187,6 +231,12 @@ class SPAIRGridFeatureNetwork(torch.nn.Module):
             (out_index, in_index), pos, batch, pos_sample, batch_sample, voxel_cluster, voxel_cluster_sample, inv = \
                 voxel_mean_pool(pos=pos, batch=batch, start=min_pos, end=max_pos, size=2 / 16)
             feature = feature[inv]
+
+            num_pts = scatter_sum(
+                torch.ones_like(out_index, dtype=torch.long),
+                out_index, dim=0, dim_size=pos_sample.size(0)
+            )
+            assert (num_pts > 0).all(), "Empty cluster detected before next PointConv"
         _mem("GridFeat:after pool2")
 
         with _nvtx("GridFeat.conv3"):
@@ -198,23 +248,40 @@ class SPAIRGridFeatureNetwork(torch.nn.Module):
         pos = pos_sample
         batch = batch_sample
 
+        self._assert_finite("GridFeat.after conv3", feature)
         with _nvtx("GridFeat.radius_graph_2"):
             edge_index = radius_graph(pos, 4 / 16, batch, loop=True)
         if self.ar:
             with _nvtx("GridFeat.ar3-5"):
                 feature, _, _ = self.ar3(feature, pos, edge_index)
+                self._assert_finite("GridFeat.after ar3", feature)
                 feature, _, _ = self.ar4(feature, pos, edge_index)
+                self._assert_finite("GridFeat.after ar4", feature)
                 feature, _, _ = self.ar5(feature, pos, edge_index)
+                self._assert_finite("GridFeat.after ar5", feature)
+
         if self.layer_norm:
             feature = self.norm3(feature, batch)
+            self._assert_finite("GridFeat.after norm3", feature)
 
         voxel_center = find_voxel_center(pos, start=min_pos, size=2 / 16)
+
+        self._assert_finite("GridFeat.before_center_shift.feature", feature)
+        self._assert_finite("GridFeat.before_center_shift.pos", pos)
+        self._assert_finite("GridFeat.before_center_shift.voxel_center", voxel_center)
 
         with _nvtx("GridFeat.center_shift"):
             center_feature = self.conv4(feature, pos, voxel_center)
 
         with _nvtx("GridFeat.linear"):
             out = self.linear(center_feature)
+        # Debug: find origin of non-finites
+        if not self._assert_finite("GridFeat.center_feature", center_feature):
+            center_feature = torch.nan_to_num(center_feature, nan=0.0, posinf=1e4, neginf=-1e4)
+            out = self.linear(center_feature)
+
+        if not self._assert_finite("GridFeat.linear.out", out):
+            out = torch.nan_to_num(out, nan=0.0, posinf=1e4, neginf=-1e4)
 
         if self.glimpse_type == "ball":
             mu_pos, sigma_pos, mu_size_ratio, sigma_size_ratio, glimpse__logit_pres = \
@@ -223,6 +290,21 @@ class SPAIRGridFeatureNetwork(torch.nn.Module):
             mu_pos, sigma_pos, mu_size_ratio, sigma_size_ratio, glimpse__logit_pres = \
                 torch.split(out, [3, 3, 3, 3, 1], dim=1)
 
+
+        # Final guard before building distributions
+        for tag, t in [
+            ("mu_pos", mu_pos), ("sigma_pos", sigma_pos),
+            ("mu_size_ratio", mu_size_ratio), ("sigma_size_ratio", sigma_size_ratio)
+        ]:
+            if not self._assert_finite(f"GridFeat.{tag}", t):
+                # sanitize and keep going so we can see the rest of the step
+                locals()[tag] = torch.nan_to_num(t, nan=0.0, posinf=1e4, neginf=-1e4)
+
+        sigma_pos = to_sigma(sigma_pos).clamp_min(1e-6)
+        sigma_size_ratio = to_sigma(sigma_size_ratio).clamp_min(1e-6)
+
+        pos_post       = Normal(mu_pos,        sigma_pos)
+        size_ratio_post= Normal(mu_size_ratio, sigma_size_ratio)
         pos_post = Normal(mu_pos, to_sigma(sigma_pos))
         size_ratio_post = Normal(mu_size_ratio, to_sigma(sigma_size_ratio))
 
@@ -239,7 +321,16 @@ class SPAIRGridFeatureNetwork(torch.nn.Module):
         _mem("GridFeat:end")
         return (glimpse__center_offset_ratio, glimpse__ball_radius_ratio, log_z_pres, glimpse__logit_pres), \
                (pos_post, size_ratio_post, pres_post), voxel_center, feature, pos, batch_sample
-
+    
+    def _assert_finite(self,tag, *tensors):
+        for t in tensors:
+            if t is None: 
+                continue
+            if not torch.isfinite(t).all():
+                bad = (~torch.isfinite(t)).nonzero(as_tuple=False)[:5]
+                print(f"[NaN/Inf] {tag}: found {bad.shape[0]} bad values; first idx: {bad.flatten().tolist()[:10]}")
+                return False
+        return True
 
 class SPAIRGlimpseEncoder(torch.nn.Module):
     def __init__(self, cfg):
@@ -694,14 +785,43 @@ class CoarseVAE(torch.nn.Module):
     def __init__(self):
         super().__init__()
         self.encoder = CoarseEncoder()
-        self.decoder = SPAIRPointPosFlow(latent_size = 256)
+        self.decoder = SPAIRPointPosFlow(latent_size=256)
+        # Tunables (keep small and predictable)
+        self.flow_points_per_center = 32   # try 16/32/64
+        self.flow_chunk_centers     = 64   # chunk coarse centers to cap peak mem
 
-    def forward(self, voxel__pos, voxel__feature, voxel__batch, batch):
+    def forward(self, voxel__pos, voxel__feature, voxel__batch, _ignored_batch):
         _reset_peak()
         _mem("CoarseVAE:start")
+
         with _nvtx("CoarseVAE.encoder"):
-            z_what_coarse, what_coarse_post, pos_center_batch = self.encoder(voxel__pos, voxel__feature, voxel__batch)
+            z_what_coarse, what_coarse_post, pos_center_batch = \
+                self.encoder(voxel__pos, voxel__feature, voxel__batch)
+            # z_what_coarse: [K, 256], one latent per coarse center
+
+        # Build a compact flow plan: K centers × ppc samples per center
+        K   = z_what_coarse.size(0)
+        ppc = self.flow_points_per_center
+
+        preds_pos, preds_idx = [], []
+
         with _nvtx("CoarseVAE.decoder"):
-            coarse_point_predict, pos_predict_batch = self.decoder(z_what_coarse, batch, False, extra_predict_ratio=0.0)
+            for s in range(0, K, self.flow_chunk_centers):
+                e = min(K, s + self.flow_chunk_centers)
+                z_chunk = z_what_coarse[s:e]                # [(e-s), 256]
+                # compact group ids [0..(e-s-1)], each repeated ppc times
+                flow_batch = torch.arange(e - s, device=z_chunk.device).repeat_interleave(ppc)
+
+                pos_c, idx_c = self.decoder(
+                    z_chunk, flow_batch, center_flag=False, extra_predict_ratio=0.0
+                )
+                # Re-offset indices back to global center ids
+                preds_pos.append(pos_c)
+                preds_idx.append(idx_c + s)
+
+        coarse_point_predict = torch.cat(preds_pos, dim=0)
+        pos_predict_batch    = torch.cat(preds_idx, dim=0)
+
         _mem("CoarseVAE:end")
         return coarse_point_predict, pos_predict_batch, what_coarse_post
+
