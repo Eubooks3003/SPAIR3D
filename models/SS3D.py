@@ -395,175 +395,378 @@ class SS3D_SPAIR_v1(torch.nn.Module):
         # We’re not adding a KL on z_pres here (common in SPAIR variants).
         return DKL, glimpse__log_z_pres, glimpse__logit_pres
 
+    def compute_rc_loss(
+        self, pos, rgb, batch, 
+        glimpse_member__log_mask, 
+        glimpse_member__rgb,
+        glimpse_member__local_pos,
+        glimpse_member__glimpse_index, 
+        glimpse_member__point_index,
+        glimpse_member__log_boundary_weight,
+        glimpse_member__batch,
+        glimpse_member__size,
+        glimpse_predict__local_pos, 
+        glimpse_predict__glimpse_index,
+        glimpse__center, 
+        # glimpse__center_diff,
+        glimpse__log_z_pres, 
+        glimpse__batch,
+        bg_predict__pos,
+        bg_predict__batch
+    ):
+        import torch
 
+        # ---------- helpers ----------
+        def _stats(t):
+            try:
+                t_det = t.detach()
+                # Use nan* to avoid crashing when NaNs already exist.
+                tmin = torch.nanmin(t_det).item() if t_det.numel() else float('nan')
+                tmax = torch.nanmax(t_det).item() if t_det.numel() else float('nan')
+                tmean = torch.nanmean(t_det).item() if t_det.numel() else float('nan')
+            except Exception:
+                tmin = tmax = tmean = float('nan')
+            return tmin, tmax, tmean
 
-    def compute_rc_loss(self, pos, rgb, batch, 
-                            glimpse_member__log_mask, 
-                            glimpse_member__rgb,
-                            glimpse_member__local_pos,
-                            glimpse_member__glimpse_index, 
-                            glimpse_member__point_index,
-                            glimpse_member__log_boundary_weight,
-                            glimpse_member__batch,
-                            glimpse_member__size,
-                            glimpse_predict__local_pos, 
-                            glimpse_predict__glimpse_index,
-                            glimpse__center, 
-                            # glimpse__center_diff,
-                            glimpse__log_z_pres, 
-                            glimpse__batch,
-                            bg_predict__pos,
-                            bg_predict__batch):
+        def _check(name, t):
+            if not torch.is_tensor(t):
+                return
+            n_nan = torch.isnan(t).sum().item()
+            n_inf = torch.isinf(t).sum().item()
+            if (n_nan + n_inf) > 0:
+                tmin, tmax, tmean = _stats(t)
+                print(f"[NF] {name:40s} | shape={tuple(t.shape)} dtype={t.dtype} "
+                    f"NaN={n_nan} Inf={n_inf} min={tmin:.4g} max={tmax:.4g} mean={tmean:.4g}")
+
+        def _check_idx(name, idx, limit):
+            if not torch.is_tensor(idx):
+                return
+            if idx.numel() == 0:
+                return
+            too_low = (idx < 0).sum().item()
+            too_high = (idx >= limit).sum().item()
+            if too_low or too_high:
+                print(f"[IDX] {name:40s} | shape={tuple(idx.shape)} "
+                    f"out_of_range_low={too_low} out_of_range_high={too_high} limit={limit}")
 
         device = pos.device
 
+        # ---------- input checks ----------
+        _check("pos", pos)
+        _check("rgb", rgb)
+        _check("batch", batch)
+        _check("glimpse_member__log_mask", glimpse_member__log_mask)
+        _check("glimpse_member__rgb", glimpse_member__rgb)
+        _check("glimpse_member__local_pos", glimpse_member__local_pos)
+        _check("glimpse_member__glimpse_index", glimpse_member__glimpse_index)
+        _check("glimpse_member__point_index", glimpse_member__point_index)
+        _check("glimpse_member__log_boundary_weight", glimpse_member__log_boundary_weight)
+        _check("glimpse_member__batch", glimpse_member__batch)
+        _check("glimpse_member__size", glimpse_member__size)
+        _check("glimpse_predict__local_pos", glimpse_predict__local_pos)
+        _check("glimpse_predict__glimpse_index", glimpse_predict__glimpse_index)
+        _check("glimpse__center", glimpse__center)
+        _check("glimpse__log_z_pres", glimpse__log_z_pres)
+        _check("glimpse__batch", glimpse__batch)
+        _check("bg_predict__pos", bg_predict__pos)
+        _check("bg_predict__batch", bg_predict__batch)
+
+        # Optional rescale
         if self.fix_scale:
-            glimpse_member__local_pos = glimpse_member__local_pos * glimpse_member__size / self.box_size_max
+            glimpse_member__local_pos = (
+                glimpse_member__local_pos * glimpse_member__size / self.box_size_max
+            )
+            _check("glimpse_member__local_pos (rescaled)", glimpse_member__local_pos)
 
-        # combine member mask and glimpse pres to get unnormalized alpha
-        glimpse_member__log_mask.squeeze_(1)
+        # Combine mask + presence + boundary into unnormalized alpha (log-space)
+        glimpse_member__log_mask = glimpse_member__log_mask.squeeze(1)
+        _check("glimpse_member__log_mask (squeezed)", glimpse_member__log_mask)
+
+        _check_idx("glimpse_member__glimpse_index", glimpse_member__glimpse_index, glimpse__log_z_pres.size(0))
         glimpse_member__log_z_pres = glimpse__log_z_pres[glimpse_member__glimpse_index]
+        _check("glimpse_member__log_z_pres (gather)", glimpse_member__log_z_pres)
 
-        full_point_index = torch.arange(pos.size(0), dtype=torch.long, device=device)
+        glimpse_member__log_alpha = (
+            glimpse_member__log_mask
+            + glimpse_member__log_z_pres
+            + glimpse_member__log_boundary_weight
+        )
+        _check("glimpse_member__log_alpha (pre-softmax)", glimpse_member__log_alpha)
 
-        glimpse_member__log_alpha = glimpse_member__log_mask + glimpse_member__log_z_pres + glimpse_member__log_boundary_weight #+ glimpse_member__center_log_likelihood
-        glimpse_member__normalized_log_alpha = scatter_log_softmax(self.alpha_temperature * glimpse_member__log_alpha, glimpse_member__point_index, dim = 0) + glimpse_member__log_alpha
+        # Softmax within each ground-truth point's members (log-domain, stable)
+        glimpse_member__normalized_log_alpha = (
+            scatter_log_softmax(
+                self.alpha_temperature * glimpse_member__log_alpha,
+                glimpse_member__point_index,
+                dim=0,
+            )
+            + glimpse_member__log_alpha
+        )
+        _check("glimpse_member__normalized_log_alpha", glimpse_member__normalized_log_alpha)
 
-        #################################################################################################################################################
-        # compute distance from truth points covered by at least one glimpse to its closest prediction points in global scale, distance is computed glimpse-wise
-        # * forward 
-        glimpse_member_index, glimpse_predict_index = knn(glimpse_predict__local_pos, glimpse_member__local_pos, 1, batch_x = glimpse_predict__glimpse_index, batch_y = glimpse_member__glimpse_index)   # compute foreground correspondence
-        
-        # * it is optional to zoom back to global distance
-        glimpse_chamfer_predict__local_pos = glimpse_predict__local_pos[glimpse_predict_index]
-        distance_forward_fg = torch.norm((glimpse_member__local_pos - glimpse_chamfer_predict__local_pos) * self.fg_distance_scale, p = None, dim = -1) 
+        # ---------- Foreground (forward): gt(member) -> pred(glimpse) ----------
+        gm_idx, gp_idx = knn(
+            glimpse_predict__local_pos, glimpse_member__local_pos, 1,
+            batch_x=glimpse_predict__glimpse_index,
+            batch_y=glimpse_member__glimpse_index,
+        )
+        _check("gm_idx", gm_idx)
+        _check("gp_idx", gp_idx)
+        _check_idx("gp_idx bounds", gp_idx, glimpse_member__local_pos.size(0))
+
+        glimpse_chamfer_predict__local_pos = glimpse_predict__local_pos[gp_idx]
+        _check("glimpse_chamfer_predict__local_pos", glimpse_chamfer_predict__local_pos)
+
+        distance_forward_fg = torch.norm(
+            (glimpse_member__local_pos - glimpse_chamfer_predict__local_pos) * self.fg_distance_scale,
+            dim=-1,
+        )
+        _check("distance_forward_fg", distance_forward_fg)
+
         LL_forward_fg = self.pos_reconstruct_prob.log_prob(distance_forward_fg)
+        _check("LL_forward_fg", LL_forward_fg)
 
-        glimpse_fg_chamfer_member__normalized_log_alpha = glimpse_member__normalized_log_alpha # gather the alpha value of the corresponding gt point of the selected predict point
-        glimpse_chamfer_member__point_index = glimpse_member__point_index                      # gather the point index of the corresponding gt point of the selected predict point
+        # These feed into the per-point aggregation (no reindexing here for forward-fg)
+        glimpse_fg_chamfer_member__normalized_log_alpha = glimpse_member__normalized_log_alpha
+        glimpse_chamfer_member__point_index = glimpse_member__point_index
+        _check("glimpse_fg_chamfer_member__normalized_log_alpha", glimpse_fg_chamfer_member__normalized_log_alpha)
 
-        # ! will return -inf for index not included in index
-        fg_log_alpha = scatter_logsumexp(glimpse_fg_chamfer_member__normalized_log_alpha, glimpse_chamfer_member__point_index, dim = 0, dim_size = pos.size(0))
+        # Sum of fg alpha per *point* in log-space; -inf where no fg covers that point
+        fg_log_alpha = scatter_logsumexp(
+            glimpse_fg_chamfer_member__normalized_log_alpha,
+            glimpse_chamfer_member__point_index,
+            dim=0,
+            dim_size=pos.size(0),
+        )
+        _check("fg_log_alpha (pre-clamp)", fg_log_alpha)
 
-        bg_log_alpha = torch.log(-torch.expm1(fg_log_alpha) + 1e-12)
+        # ---------- Stable background alpha ----------
+        def safe_log1mexp(x):
+            # x expected ≤ 0
+            x = torch.where(torch.isnan(x), torch.full_like(x, -1e9), x)  # sanitize NaN
+            x = torch.clamp_max(x, 0)  # ensure ≤ 0
+            cutoff = -0.6931471805599453  # -ln 2
+            small = x <= cutoff
+            # compute both branches fully; then select (no uninitialized slots)
+            a = torch.log1p(-torch.exp(x))      # stable when x <= -ln2
+            b = torch.log(-torch.expm1(x))      # stable when -ln2 < x <= 0
+            out = torch.where(small, a, b)
+            # final sanitize: if something still went non-finite, slam it to a safe floor
+            out = torch.where(torch.isfinite(out), out, torch.full_like(out, -1e12))
+            return out
 
-        glimpse_bg_chamfer_member__normalized_log_alpha = bg_log_alpha
-    
 
-        index, bg_predict_index = knn(bg_predict__pos, pos, 1, batch_x = bg_predict__batch, batch_y = batch)   # compute background correspondence
-        bg_chamfer_predict__pos = bg_predict__pos[bg_predict_index]
-        distance_forward_bg = torch.norm((pos - bg_chamfer_predict__pos) * self.bg_distance_scale, dim = -1)
+        # Clamp any positive fg_log_alpha down to 0
+        fg_log_alpha = torch.minimum(fg_log_alpha, torch.zeros_like(fg_log_alpha))
+        _check("fg_log_alpha (clamped <= 0)", fg_log_alpha)
+
+        safe_fg = fg_log_alpha.clone()
+        # Replace -inf with a very negative number (exp(-1e9) ~ 0)
+        neg_inf_mask = (safe_fg == float('-inf'))
+        if neg_inf_mask.any():
+            print(f"[INFO] fg_log_alpha contains -inf at {int(neg_inf_mask.sum().item())} positions; replacing with -1e9 for stability.")
+            safe_fg[neg_inf_mask] = -1e9
+
+        # After you compute fg_log_alpha:
+        # exact handling of uncovered points: bg = log(1) = 0
+        is_neg_inf = torch.isneginf(fg_log_alpha)
+        safe_fg = torch.where(is_neg_inf, torch.full_like(fg_log_alpha, -1e9), fg_log_alpha)
+        fg_clamped = torch.where(
+            is_neg_inf,
+            fg_log_alpha,                                        # keep -inf as is for exact uncovered handling
+            torch.clamp(fg_log_alpha, min=-60.0, max=-1e-6),
+        )
+
+        # bg for uncovered points is exactly 0; otherwise use stable log(1 - exp(fg))
+        bg_log_alpha = torch.empty_like(fg_log_alpha)
+        bg_log_alpha[is_neg_inf] = 0.0
+        mask = ~is_neg_inf
+        bg_log_alpha[mask] = torch.clamp(safe_log1mexp(fg_clamped[mask]), min=-60.0)
+
+        _check("bg_log_alpha", bg_log_alpha)
+
+        # ---------- Background (forward): pred(bg) -> gt(point) ----------
+        bgp_idx, idx_pos = knn(
+            bg_predict__pos, pos, 1,
+            batch_x=bg_predict__batch, batch_y=batch,
+        )
+        _check("bgp_idx", bgp_idx)
+        _check("idx_pos", idx_pos)
+        _check_idx("idx_pos bounds", idx_pos, bg_predict__pos.size(0))
+
+        bg_chamfer_predict__pos = bg_predict__pos[idx_pos]
+        _check("bg_chamfer_predict__pos", bg_chamfer_predict__pos)
+
+        distance_forward_bg = torch.norm(
+            (pos - bg_chamfer_predict__pos) * self.bg_distance_scale,
+            dim=-1,
+        )
+        _check("distance_forward_bg", distance_forward_bg)
+
         LL_forward_bg = self.pos_reconstruct_prob.log_prob(distance_forward_bg)
+        _check("LL_forward_bg", LL_forward_bg)
 
+        # Weights for forward terms
         weighted_LL_forward_fg = LL_forward_fg + glimpse_fg_chamfer_member__normalized_log_alpha
-        weighted_LL_forward_bg = LL_forward_bg + glimpse_bg_chamfer_member__normalized_log_alpha
+        _check("weighted_LL_forward_fg", weighted_LL_forward_fg)
+        weighted_LL_forward_bg = LL_forward_bg + bg_log_alpha
+        _check("weighted_LL_forward_bg", weighted_LL_forward_bg)
 
-        LL_forward = torch.cat((weighted_LL_forward_fg, weighted_LL_forward_bg), dim = 0)
-        point_index = torch.cat((glimpse_chamfer_member__point_index, full_point_index), dim = 0)
+        # Concatenate and reduce per point, then per batch
+        LL_forward = torch.cat(
+            (weighted_LL_forward_fg, weighted_LL_forward_bg),
+            dim=0
+        )
+        _check("LL_forward (concat)", LL_forward)
 
-        # sum over points that are covered by more than one glimpse and background to get point wise likelihood 
-        LL_forward = scatter_logsumexp(LL_forward, index = point_index, dim = 0)
-        
-        # get the complete likelihood of each batch
-        LL_forward = scatter_sum(LL_forward, batch, dim = 0)
+        point_index = torch.cat(
+            (glimpse_chamfer_member__point_index, torch.arange(pos.size(0), device=device, dtype=torch.long)),
+            dim=0
+        )
+        _check("point_index (concat)", point_index)
+        _check_idx("point_index bounds", point_index, max(pos.size(0), glimpse_chamfer_member__point_index.max().item()+1 if glimpse_chamfer_member__point_index.numel() else 0))
 
-        #################################################################################################################################################
-        # compute distance from prediction points of each glimpse to its closest truth points in global scale, distance is computed glimpse-wise
-        # * backward
+        LL_forward = scatter_logsumexp(LL_forward, index=point_index, dim=0)
+        _check("LL_forward (per-point)", LL_forward)
+        LL_forward = scatter_sum(LL_forward, batch, dim=0)
+        _check("LL_forward (per-batch)", LL_forward)
 
-        glimpse_predict_index, glimpse_member_index = knn(glimpse_member__local_pos, glimpse_predict__local_pos, 1, batch_x = glimpse_member__glimpse_index, batch_y = glimpse_predict__glimpse_index)  
+        # ---------- Foreground (backward): pred(glimpse) -> gt(member) ----------
+        gp_idx2, gm_idx2 = knn(
+            glimpse_member__local_pos, glimpse_predict__local_pos, 1,
+            batch_x=glimpse_member__glimpse_index, batch_y=glimpse_predict__glimpse_index,
+        )
+        _check("gp_idx2", gp_idx2)
+        _check("gm_idx2", gm_idx2)
+        _check_idx("gm_idx2 bounds", gm_idx2, glimpse_member__local_pos.size(0))
 
-        # * it is optional to zoom back to global distance
-        distance_backward_fg = torch.norm((glimpse_member__local_pos[glimpse_member_index] - glimpse_predict__local_pos) * self.fg_distance_scale, p = None, dim = -1)
+        distance_backward_fg = torch.norm(
+            (glimpse_member__local_pos[gm_idx2] - glimpse_predict__local_pos) * self.fg_distance_scale,
+            dim=-1
+        )
+        _check("distance_backward_fg", distance_backward_fg)
+
         LL_backward_fg = self.pos_reconstruct_prob.log_prob(distance_backward_fg)
+        _check("LL_backward_fg", LL_backward_fg)
 
-        glimpse_fg_chamfer_member__normalized_log_alpha = glimpse_member__normalized_log_alpha[glimpse_member_index]
+        glimpse_fg_chamfer_member__normalized_log_alpha_bwd = glimpse_member__normalized_log_alpha[gm_idx2]
+        _check("glimpse_fg_chamfer_member__normalized_log_alpha_bwd", glimpse_fg_chamfer_member__normalized_log_alpha_bwd)
 
-        bg_predict_index, index = knn(pos, bg_predict__pos, 1, batch_x = batch, batch_y = bg_predict__batch)   # compute background correspondence
-        distance_bg = torch.norm((pos[index] - bg_predict__pos) * self.bg_distance_scale, dim = -1)
+        # ---------- Background (backward): pred(bg) -> gt(point) ----------
+        bgp_idx2, idx_pos2 = knn(
+            pos, bg_predict__pos, 1,
+            batch_x=batch, batch_y=bg_predict__batch,
+        )
+        _check("bgp_idx2", bgp_idx2)
+        _check("idx_pos2", idx_pos2)
+        _check_idx("idx_pos2 bounds", idx_pos2, pos.size(0))
+
+        distance_bg = torch.norm(
+            (pos[idx_pos2] - bg_predict__pos) * self.bg_distance_scale,
+            dim=-1
+        )
+        _check("distance_bg (backward bg)", distance_bg)
+
         LL_backward_bg = self.pos_reconstruct_prob.log_prob(distance_bg)
+        _check("LL_backward_bg", LL_backward_bg)
 
-        glimpse_bg_chamfer_member__normalized_log_alpha = bg_log_alpha[index]
+        glimpse_bg_chamfer_member__normalized_log_alpha_bwd = bg_log_alpha[idx_pos2]
+        _check("glimpse_bg_chamfer_member__normalized_log_alpha_bwd", glimpse_bg_chamfer_member__normalized_log_alpha_bwd)
 
-        # * backward LL 3:
-        weighted_LL_backward_fg = LL_backward_fg * torch.exp(glimpse_fg_chamfer_member__normalized_log_alpha)
-        weighted_LL_backward_bg = LL_backward_bg * torch.exp(glimpse_bg_chamfer_member__normalized_log_alpha)
+        # ---------- Backward aggregation ----------
+        weighted_LL_backward_fg = LL_backward_fg * torch.exp(glimpse_fg_chamfer_member__normalized_log_alpha_bwd)
+        _check("weighted_LL_backward_fg", weighted_LL_backward_fg)
+        LL_backward_fg_perglimpse = scatter_sum(
+            weighted_LL_backward_fg, glimpse__batch[glimpse_predict__glimpse_index], dim=0
+        )
+        _check("LL_backward_fg_perglimpse", LL_backward_fg_perglimpse)
 
-        LL_backward_fg = scatter_sum(weighted_LL_backward_fg, glimpse__batch[glimpse_predict__glimpse_index], dim = 0)
-        LL_backward_bg = scatter_sum(weighted_LL_backward_bg, bg_predict__batch, dim =0)
+        weighted_LL_backward_bg = LL_backward_bg * torch.exp(glimpse_bg_chamfer_member__normalized_log_alpha_bwd)
+        _check("weighted_LL_backward_bg", weighted_LL_backward_bg)
+        LL_backward_bg_perbg = scatter_sum(weighted_LL_backward_bg, bg_predict__batch, dim=0)
+        _check("LL_backward_bg_perbg", LL_backward_bg_perbg)
 
-        LL_backward = LL_backward_fg + LL_backward_bg
+        LL_backward = LL_backward_fg_perglimpse + LL_backward_bg_perbg
+        _check("LL_backward (sum)", LL_backward)
 
-        LL_backward_fg = torch.mean(LL_backward_fg)
-        LL_backward_bg = torch.mean(LL_backward_bg)
+        # Means for logging
+        LL_backward_fg_mean = torch.mean(LL_backward_fg_perglimpse)
+        LL_backward_bg_mean = torch.mean(LL_backward_bg_perbg)
+        _check("LL_backward_fg_mean", LL_backward_fg_mean)
+        _check("LL_backward_bg_mean", LL_backward_bg_mean)
 
         LL_avg_forward = torch.mean(LL_forward)
         LL_avg_backward = torch.mean(LL_backward)
+        _check("LL_avg_forward", LL_avg_forward)
+        _check("LL_avg_backward", LL_avg_backward)
 
-        return (LL_avg_forward, 
-                LL_avg_backward, 
-                bg_log_alpha, 
-                glimpse_member__normalized_log_alpha, 
-                # glimpse__center_log_likelihood, 
-                LL_backward_fg, 
-                LL_backward_bg, 
-                glimpse_chamfer_predict__local_pos, 
-                bg_chamfer_predict__pos)
+        return (
+            LL_avg_forward,
+            LL_avg_backward,
+            bg_log_alpha,
+            glimpse_member__normalized_log_alpha,
+            LL_backward_fg_mean,
+            LL_backward_bg_mean,
+            glimpse_chamfer_predict__local_pos,
+            bg_chamfer_predict__pos,
+        )
 
-    def compute_alpha(self, pos, rgb, batch, 
-                    glimpse_member__log_mask, 
-                    glimpse_member__rgb,
-                    glimpse_member__local_pos,
-                    glimpse_member__glimpse_index, 
-                    glimpse_member__point_index,
-                    glimpse_member__log_boundary_weight,
-                    glimpse_member__batch, 
-                    glimpse_predict__local_pos, 
-                    glimpse_predict__glimpse_index,
-                    glimpse__center, 
-                    glimpse__log_z_pres,
-                    glimpse__logit_pres,
-                    glimpse__consecutive_to_nonconsecutive_glimpse_index,
-                    glimpse__batch,
-                    bg_predict__pos,
-                    bg_predict__batch, 
-                    flag):
 
-        if flag:
-            log_z_pres = glimpse__log_z_pres[glimpse__consecutive_to_nonconsecutive_glimpse_index]
-            logit_pres = glimpse__logit_pres[glimpse__consecutive_to_nonconsecutive_glimpse_index]
+    # def compute_alpha(self, pos, rgb, batch, 
+    #                 glimpse_member__log_mask, 
+    #                 glimpse_member__rgb,
+    #                 glimpse_member__local_pos,
+    #                 glimpse_member__glimpse_index, 
+    #                 glimpse_member__point_index,
+    #                 glimpse_member__log_boundary_weight,
+    #                 glimpse_member__batch, 
+    #                 glimpse_predict__local_pos, 
+    #                 glimpse_predict__glimpse_index,
+    #                 glimpse__center, 
+    #                 glimpse__log_z_pres,
+    #                 glimpse__logit_pres,
+    #                 glimpse__consecutive_to_nonconsecutive_glimpse_index,
+    #                 glimpse__batch,
+    #                 bg_predict__pos,
+    #                 bg_predict__batch, 
+    #                 flag):
 
-        device = pos.device
+    #     if flag:
+    #         log_z_pres = glimpse__log_z_pres[glimpse__consecutive_to_nonconsecutive_glimpse_index]
+    #         logit_pres = glimpse__logit_pres[glimpse__consecutive_to_nonconsecutive_glimpse_index]
 
-        # combine member mask and glimpse pres to get unnormalized alpha
-        glimpse_member__log_mask.squeeze_(1)
-        glimpse_member__log_z_pres = glimpse__log_z_pres[glimpse_member__glimpse_index]
+    #     device = pos.device
 
-        full_point_index = torch.arange(pos.size(0), dtype=torch.long, device=device)
+    #     # combine member mask and glimpse pres to get unnormalized alpha
+    #     glimpse_member__log_mask.squeeze_(1)
+    #     glimpse_member__log_z_pres = glimpse__log_z_pres[glimpse_member__glimpse_index]
 
-        glimpse_member__log_alpha = glimpse_member__log_mask + glimpse_member__log_z_pres + glimpse_member__log_boundary_weight #+ glimpse_member__center_log_likelihood
-        glimpse_member__normalized_log_alpha = scatter_log_softmax(self.alpha_temperature * glimpse_member__log_alpha, glimpse_member__point_index, dim = 0) + glimpse_member__log_alpha
+    #     full_point_index = torch.arange(pos.size(0), dtype=torch.long, device=device)
 
-        glimpse_member_index, glimpse_predict_index = knn(glimpse_predict__local_pos, glimpse_member__local_pos, 1, batch_x = glimpse_predict__glimpse_index, batch_y = glimpse_member__glimpse_index)   # compute foreground correspondence
+    #     glimpse_member__log_alpha = glimpse_member__log_mask + glimpse_member__log_z_pres + glimpse_member__log_boundary_weight #+ glimpse_member__center_log_likelihood
+    #     glimpse_member__normalized_log_alpha = scatter_log_softmax(self.alpha_temperature * glimpse_member__log_alpha, glimpse_member__point_index, dim = 0) + glimpse_member__log_alpha
+
+    #     glimpse_member_index, glimpse_predict_index = knn(glimpse_predict__local_pos, glimpse_member__local_pos, 1, batch_x = glimpse_predict__glimpse_index, batch_y = glimpse_member__glimpse_index)   # compute foreground correspondence
         
-        # * it is optional to zoom back to global distance
-        glimpse_chamfer_predict__local_pos = glimpse_predict__local_pos[glimpse_predict_index]
-        distance_forward_fg = torch.norm((glimpse_member__local_pos - glimpse_chamfer_predict__local_pos) * self.fg_distance_scale, p = None, dim = -1) 
-        LL_forward_fg = self.pos_reconstruct_prob.log_prob(distance_forward_fg)
+    #     # * it is optional to zoom back to global distance
+    #     glimpse_chamfer_predict__local_pos = glimpse_predict__local_pos[glimpse_predict_index]
+    #     distance_forward_fg = torch.norm((glimpse_member__local_pos - glimpse_chamfer_predict__local_pos) * self.fg_distance_scale, p = None, dim = -1) 
+    #     LL_forward_fg = self.pos_reconstruct_prob.log_prob(distance_forward_fg)
 
-        glimpse_fg_chamfer_member__normalized_log_alpha = glimpse_member__normalized_log_alpha # gather the alpha value of the corresponding gt point of the selected predict point
-        glimpse_chamfer_member__point_index = glimpse_member__point_index   
+    #     glimpse_fg_chamfer_member__normalized_log_alpha = glimpse_member__normalized_log_alpha # gather the alpha value of the corresponding gt point of the selected predict point
+    #     glimpse_chamfer_member__point_index = glimpse_member__point_index   
 
-        fg_log_alpha = scatter_logsumexp(glimpse_fg_chamfer_member__normalized_log_alpha, glimpse_chamfer_member__point_index, dim = 0, dim_size = pos.size(0))
+    #     fg_log_alpha = scatter_logsumexp(glimpse_fg_chamfer_member__normalized_log_alpha, glimpse_chamfer_member__point_index, dim = 0, dim_size = pos.size(0))
 
-        bg_log_alpha = torch.log(-torch.expm1(fg_log_alpha) + 1e-12)
 
-        glimpse_bg_chamfer_member__normalized_log_alpha = bg_log_alpha
+    #     bg_log_alpha = torch.log(-torch.expm1(fg_log_alpha) + 1e-12)
 
-        index, bg_predict_index = knn(bg_predict__pos, pos, 1, batch_x = bg_predict__batch, batch_y = batch)   # compute background correspondence
-        bg_chamfer_predict__pos = bg_predict__pos[bg_predict_index]
-        distance_forward_bg = torch.norm((pos - bg_chamfer_predict__pos) * self.bg_distance_scale, dim = -1)
-        LL_forward_bg = self.pos_reconstruct_prob.log_prob(distance_forward_bg)
+    #     glimpse_bg_chamfer_member__normalized_log_alpha = bg_log_alpha
+
+    #     index, bg_predict_index = knn(bg_predict__pos, pos, 1, batch_x = bg_predict__batch, batch_y = batch)   # compute background correspondence
+    #     bg_chamfer_predict__pos = bg_predict__pos[bg_predict_index]
+    #     distance_forward_bg = torch.norm((pos - bg_chamfer_predict__pos) * self.bg_distance_scale, dim = -1)
+    #     LL_forward_bg = self.pos_reconstruct_prob.log_prob(distance_forward_bg)
     
     def forward(self, pos, rgb, norm, batch):
 

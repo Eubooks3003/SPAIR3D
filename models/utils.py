@@ -2,7 +2,7 @@ import os
 import numpy as np
 import math
 import time
-import matplotlib.pyplot as plt
+# import matplotlib.pyplot as plt
 from sklearn.metrics.cluster import adjusted_rand_score
 
 import torch

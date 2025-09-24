@@ -304,6 +304,8 @@ def main():
              glimpse_chamfer_predict__local_pos,
              bg_chamfer_predict__pos) = model(pos, None, None, batch)
 
+            
+
             # Dash / metrics visualization (rank 0 only)
             if is_master and (iter_idx % config.dash_plot_every) == 0:
                 with torch.no_grad():
@@ -326,6 +328,7 @@ def main():
                     )
                 fprint(f"{iter_idx}: ARI={ARI:.4f}, SC={sc:.4f}, mSC={mSC:.4f}")
 
+            print("bg_log_alpha: ", bg_log_alpha.detach())
             NLL = NLL_forward + NLL_backward
             loss = NLL + DKL
 
@@ -347,6 +350,9 @@ def main():
                 z_pres = batch_statistic(torch.exp(glimpse__log_z_pres), glimpse__batch)
                 D_center = torch.mean(glimpse__center_diff)
                 bg_alpha = torch.mean(torch.exp(bg_log_alpha))
+
+                mask_nan = torch.isnan(torch.exp(bg_log_alpha))
+                print("any NaN after exp:", mask_nan.any().item())
 
                 writer.add_scalar('loss', loss.item(), iter_idx)
                 writer.add_scalar('NLL', NLL.item(), iter_idx)
